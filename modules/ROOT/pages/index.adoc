@@ -3,6 +3,7 @@
 // Title comes from the workshop.yaml
 // == Overview
 
+hola valen
 *Welcome to Red Hat Tech Ready 2020 and the Lab "From Jenkins to OpenShift Pipelines (Tekton)"!*
 
 link:https://www.jenkins.io[Jenkins] has been the de-facto standard for CI/CD for multiple years now. In recent additions Jenkins gained the capability to build pipelines, first in Groovy, then in declarative syntax.
