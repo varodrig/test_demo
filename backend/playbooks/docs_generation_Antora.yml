@@ -17,7 +17,13 @@
       private: no
     - name: path_origin
       prompt: Provide your content repository URL.Ex. https://github.com/redhat-gpe/example
-      private: no 
+      private: no
+    - name: content_path
+      prompt: where's your content adocs located?. Ex. workshop/content
+      private: no
+    - name: match_content
+      prompt: Do you want all your content or only labs?. Ex. A/L.
+      private: no
   
   tasks:
   
@@ -27,15 +33,25 @@
     failed_when: download.rc == "already exists and is not an empty directory" not in download.rc
     when: "{{ updateRepo == 'Y' }}"
 
+  - name: Clean root folders if needed.
+    shell: (rm -rf "{{ base_path }}{{ root }}/pages" ; rm -rf "{{ base_path }}{{ root }}"/images/)
+    register: create
+    failed_when: create.rc == "already exists" not in create.rc
+    when: "{{ updateRepo == 'Y' }}"
+
   - name: Create root folders if needed.
-    shell: (mkdir "{{ base_path }}{{ root }}/pages")
+    shell: (mkdir "{{ base_path }}{{ root }}/pages"; mkdir "{{ base_path }}{{ root }}/images/")
     register: create
     failed_when: create.rc == "already exists" not in create.rc
     when: "{{ updateRepo == 'Y' }}"
 
   - name: moving lab docs
-    shell: (find . "{{ path_tmp }}" -type f \( -iname \*_Lab.adoc  \) -exec cp -P {} "{{ base_path }}{{ root }}/pages/" \;) 
-    when: "{{ updateRepo == 'Y' }}"
+    shell: (find . "{{ path_tmp }}/{{ content_path }}" -type f \( -iname \*_Lab.adoc  \) -exec cp -P {} "{{ base_path }}{{ root }}/pages/" \;)
+    when: "{{ updateRepo == 'Y'}} and {{ match_content == 'L'}}"
+
+  - name: moving all docs
+    shell: (find  "{{ path_tmp }}/{{ content_path }}" -type f \( -iname \*.adoc  \) -exec cp -P {} "{{ base_path }}{{ root }}/pages/" \;)
+    when: "{{ updateRepo == 'Y'}} and {{ match_content == 'A'}}"
   
   - name: Create index.adoc
     shell:  (find "{{ base_path }}{{ root }}/pages" -name "{{ indexName }}" -exec mv {} "{{ base_path }}{{ root }}/pages/index.adoc" \;)
@@ -64,14 +80,12 @@
   - debug: msg="{{ replace }}"
 
   - name: Updating content in the repository (Antora)
-    shell: (rootPath=`pwd`;git add $rootPath/../../"{{ root }}"; git commit -m "{{ git_msg }}"; git push)
+    shell: (rootPath=`pwd`;git add ../../"{{ root }}/"; git commit -m "{{ git_msg }}"; git push)
 
   - name: Run Antora for adoc files
     shell: (cd ../.. ;antora --fetch antora-playbook.yml)
     register: doc
   - debug: msg="{{ doc.stdout }}"
 
-  - name: Cleaning after finishing
-    shell: (rm -rf "{{ path_tmp }}")
 
 
