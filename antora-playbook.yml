@@ -1,5 +1,5 @@
 site:
-  title: Adv. Cloud Native Development
+  title: Jenkins - Tekton
   # the 404 page and sitemap files only get generated when the url property is set
 content:
   sources:
