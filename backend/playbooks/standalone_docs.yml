@@ -12,8 +12,8 @@
     prompt: organization/user in Quay?
     private: no
   vars:
-    image_registry_path: "quay.io/{{ organization }}/containers-lab:latest"
-    image_tag: latest
+    image_registry_path: "quay.io/{{ organization }}/containers-lab:dev"
+    image_tag: dev
     container_name: "docs"
   tasks:
   - debug:
@@ -67,7 +67,7 @@
       build: 
        path: "{{ assets[1].source }}"
       name: "{{ image_registry_path }}"
-      tag: latest
+      tag: 1.0
       push: yes
       source: build
     when: "{{ assets[1].method == 'source' }}"

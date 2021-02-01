@@ -1,7 +1,7 @@
 frames: 
   - name: doc
     title: Documentation
-    url: http://localhost:8080/index.html
+    url: http://localhost:8080/content/1/index.html
     height: 80%
     width: 40%
   - name: terminal
