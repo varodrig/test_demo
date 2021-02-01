@@ -1,0 +1,845 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== Distributed Tracing Lab
+
+.Prerequisites
+* Access to a Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6.x
+
+.Goals
+* Add tracing to a distributed application through implicit and explicit instrumentation 
+* Visualize traces with Jaeger UI
+
+:numbered:
+
+== Introduction
+
+Distributed tracing is an essential tool when it comes to observe, understand and debug distributed applications. It complements per-process logging and metric monitoring. The aim of distributed tracing is to be able to reconstruct the elaborate journeys that requests and transactions take as they propagate across a distributed system.
+
+Distributed tracing is used for monitoring and troubleshooting distributed systems, including:
+
+* Distributed context propagation
+* Distributed transaction monitoring
+* Root cause analysis
+* Service dependency analysis
+* Performance and latency optimization
+
+Distributed tracing has been around for quite some time. Google for instance has been using its own implementation, Dapper, since 2004. Zipkin, originally developed at Twitter, was open-sourced in 2012.
+
+The OpenTracing initiative, hosted at the Cloud Native Computing Foundation (CNCF), aims to work towards creating more standardized APIs and instrumentation for distributed tracing. OpenTracing is comprised of an API specification, and frameworks and libraries that have implemented the specification. OpenTracing allows developers to add instrumentation to their application code using APIs that do not lock them into any one particular product or vendor.
+
+OpenTracing defines the semantics of distributed tracing concepts. +
+A _trace_ is an execution path through the system. Traces are defined implicitly by their _spans_. In particular, a trace can be thought of as a directed acyclic graph (DAG) of spans, where the edges between spans are called _references_.
+
+Each span encapsulates the following state:
+
+* An operation name
+* A start timestamp
+* A finish timestamp
+* A set of zero or more key:value span _tags_.
+* A set of zero or more span _logs_, each of which is itself a key:value map paired with a timestamp.
+* A _span context_.
+* References to zero or more causally-related spans
+
+Each _span context_ encapsulates the following state:
+
+* Implementation dependent state needed to refer to a distinct span across a process boundary. OpenTracing does not define how spans are encoded when crossing process boundaries. Jaeger for instance uses 1 header for a span, while Zipkin uses several headers.
+* _Baggage items_, which are key-value pairs that cross process boundaries
+
+A span may reference zero or more other spans that are causally related, modeled as a parent-child relationship.
+
+The OpenTracing API defines objects like `Tracer`, `Span`, and `SpanContext`.
+
+Recently, OpenTracing has been merged with OpenCensus to form the OpenTelemetry project, aiming to provide a single set of APIs, libraries, agents, and collector services to capture distributed traces and metrics from an application.
+
+Jaeger is an implementation of the OpenTracing API which was originally developed by Uber, and donated to the CNCF.
+
+Jaeger provides a number of backend components such as Agent, Collector, Query and UI. It supports Cassandra and ElasticSearch for long-term storage of collected traces.
+
+An overview of the Jaeger architecture:
+
+image::images/jaeger-architecture-v1.png[]
+
+In this lab you learn how to add distributed tracing functionality to a Quarkus application, using both implicit and explicit instrumentation. In the second part of the lab you deploy a version of the Emergency Response application that is fully instrumented for end-to-end trace propagation.
+
+== Add Distributed Tracing to the Emergency Response Application
+
+=== Set Up a Test Environment
+
+In this section of the lab you deploy the Jaeger infrastructure components as well as the responder service and its dependencies. In this lab you use the Jaeger _all-in-one_ image, which bundles all the Jaeger server components in one image, and uses ephemeral storage. This is sufficient for a lab or development environment, but obviously not for a production environment.
+
+. Make sure you are logged in the OpenShift cluster as a user with admin privileges.
+. Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+. Deploy the Jaeger operator and the Jaeger all-in-one image:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/jaeger.yml -e project_admin=user1 -e namespace_monitoring=user1-tracing
+----
++
+This playbook deploys the Jaeger operator in the `openshift-operators` namespace (the jaeger operator has cluster-wide scope), and a custom resource for the Jaeger all-in-one deployment. Jaeger is deployed in the `user1-tracing` OpenShift namespace.
+. Wait until the Jaeger all-in-one container is up and running:
++
+----
+$ oc get pods -n user1-tracing
+----
++
+.Sample output
+----
+NAME                               READY   STATUS    RESTARTS   AGE
+jaeger-9db7f5f66-9vrrf             2/2     Running   0          20s
+----
+. Obtain the URL to the Jaeger UI:
++
+----
+$ JAEGER_URL=https://$(oc get route jaeger -n user1-tracing --template='{{ .spec.host }}')
+echo $JAEGER_URL
+----
+
+. In a browser window, navigate to the Jaeger URL. Log in with your OpenShift credentials and authorize access. Expect to see the Jaeger UI home page.
++
+image::images/jaeger-ui.png[]
+
+. In this lab you will instrument the responder service of the Emergency Response application for distributed tracing. The responder service requires a Kafka broker and a PostgreSQL database. +
+Deploy the AMQ Streams operator in the `user1-tracing` namespace:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=tracing
+----
+
+. Deploy the AMQ Streams cluster:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=tracing -e zookeeper_storage_type=ephemeral -e kafka_storage_type=ephemeral
+----
++
+This command deploys a Kafka cluster consisting of 3 ZooKeeper nodes and 3 Kafka broker nodes in the `user1-tracing` namespace. Both Zookeeper and the Kafka brokers use ephemeral storage - which is perfectly acceptable in a short-lived development environment. 
+
+. Deploy the Kafka topics:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=tracing
+----
++
+This command deploys the Kafka topics used by the Emergency Response application. Every topic is created with 15 partitions and a replication factor of 3.
+
+. Deploy the PostgreSQL database. 
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/postgresql.yml -e project_admin=user1 -e project_name=tracing -e postgresql_storage_type=ephemeral
+----
++
+This command deploys a PostgreSQL version 12 database with ephemeral storage. +
+As part of the deployment of the PostgreSQL instance, the Emergency Response database and tables are created using deployment pod-based lifecycle hooks.
+
+. Deploy the responder service:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/responder_service.yml -e project_admin=user1 -e project_name=tracing -e expose_service=true
+----
++
+This command deploys the responder service image and configures the application configuration configmap. The responder service is exposed through a route.
+
+. In order to test out the responder service, you need to be able to send messages to the Kafka topics the responder service is consuming messages from. The Kafka producer application is a simple Quarkus application that allows to send messages to Kafka topic over a REST API. Install the Kafka producer application:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_producer_app.yml -e project_admin=user1 -e project_name=tracing -e kafka_topic=topic-responder-command
+----
++
+The application is configured to send messages to the `topic-responder-command` Kafka topic. The responder service consumes messages from this topic to update responder entities.
+
+. The Kafka consumer application is a simple Quarkus application that consumes messages from a given topic and logs the payload and metadata of each message to _stdout_. +
+Deploy the Kafka consumer application:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_consumer_app.yml -e project_admin=user1 -e project_name=tracing -e kafka_topic=topic-responder-event
+----
++
+The application is configured to consume messages from the `topic-responder-event`. This is the topic the responder service sends _ResponderCreatedMessage_ and _ResponderUpdatedMessage_ events to when responders are created or updated.
+
+=== Instrument the Responder Service
+
+Quarkus comes with an extension that integrates the application with OpenTracing distributed tracing, using Jaeger as OpenTracing implementation. It offers implicit instrumentation for the REST layer of the application and for the database access layer. When interacting with other systems like a distributed cache or a Kafka broker, instrumentation needs to be added to the code.
+
+In this section of the lab you add the Quarkus OpenTracing extension to the responder service. You deploy the responder service together with the Jaeger agent sidecar for trace reporting to the Jaeger collector. You verify that traces are created and are sent to the Jaeger collector. After that you instrument the responder service to propagate traces through incoming and outgoing Kafka messages. 
+
+. Check out the code for the responder service:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/responder-service.git
+$ cd responder-service
+----
+. Import the code into your IDE of choice.
+. Ensure the code builds correctly and the unit tests are succeeding:
++
+----
+$ mvn clean package
+----
+. Familiarize yourself with the code. 
+
+. Add a dependency to the Quarkus OpenTracing extension in the `pom.xml` file of the project.
++
+----
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-smallrye-opentracing</artifactId>
+    </dependency>
+----
+
+. Disable tracing in the test profile. Add the following to `src/test/resources/application.properties`:
++
+----
+quarkus.jaeger.enabled=false
+----
+
+. Add the Jaeger configuration settings to the `responder-service` configmap in the `user1-tracing` namespace.
++
+----
+$ oc edit configmap responder-service -n user1-tracing 
+----
++
+Add the following settings. Pay attention to indentation.
++
+----
+    quarkus.jaeger.agent-host-port=localhost:6831
+    quarkus.jaeger.reporter-log-spans=true
+    quarkus.jaeger.sampler-type=probabilistic
+    quarkus.jaeger.sampler-param=1
+    quarkus.jaeger.service-name=responder-service   
+----
++
+* `quarkus.jaeger.agent-host-port`: the hostname and port to communicate with the Jaeger agent over UDP. The Jaeger agent is deployed as a sidecar container, so the communication with the agent can happen over the loopback network interface.
+* `quarkus.jaeger.reporter-log-spans`: if true, the Jaeger reporter logs the spans. Useful for development and debugging.
+* `quarkus.jaeger.sampler-type`: The sample type used for sampling traces. Accepted values are `const`, `probabilistic`, `ratelimiting` and `remote`. See the Jaeger sampling documentation (https://www.jaegertracing.io/docs/1.18/sampling/#client-sampling-configuration) for more details. In this lab you use a `probabilistic` sampler with a probability of 1, which means that all requests will be sampled and recorded. 
+* `quarkus.jaeger.service-name`: the service name to be used in the traces.
+
+. Inject the Jaeger agent sidecar container into the responder service deploymentconfig. 
+* The YAML definition of the sidecar looks like: 
++
+----
+        - resources: {}
+          terminationMessagePath: /dev/termination-log
+          name: jaeger-agent
+          ports:
+            - name: zk-compact-trft
+              containerPort: 5775
+              protocol: UDP
+            - name: config-rest
+              containerPort: 5778
+              protocol: TCP
+            - name: jg-compact-trft
+              containerPort: 6831
+              protocol: UDP
+            - name: jg-binary-trft
+              containerPort: 6832
+              protocol: UDP
+            - name: admin-http
+              containerPort: 14271
+              protocol: TCP
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: jaeger-service-ca
+              readOnly: true
+              mountPath: /etc/pki/ca-trust/source/service-ca
+          terminationMessagePolicy: File
+          image: 'registry.redhat.io/distributed-tracing/jaeger-agent-rhel8:1.20'
+          args:
+            - '--reporter.grpc.host-port=jaeger-collector-headless:14250'
+            - '--reporter.type=grpc'
+            - >-
+              --reporter.grpc.tls.ca=/etc/pki/ca-trust/source/service-ca/service-ca.crt
+            - '--reporter.grpc.tls.enabled=true'
+            - >-
+              --reporter.grpc.tls.server-name=jaeger-collector-headless.user1-tracing.svc.cluster.local
+      volumes:
+        - name: jaeger-service-ca
+          configMap:
+            name: jaeger-service-ca
+            items:
+              - key: service-ca.crt
+                path: service-ca.crt
+          defaultMode: 420                     
+----
++
+Notice the `args` section which defines the startup arguments for the Jaeger agent.
++
+** `reporter.type`: the protocol used to transmit traces to the Jaeger collector. The default and recommended protocol is gRPC.
+** `reporter.grpc.host-port`: the host and port of the Jaeger collector.
+** `reporter.grpc.tls.enabled=true`: The Jaeger collector is by default configured to use TLS for communication between agents and the collector. You can verify the collector settings in the `args` section of the deployment resource of the Jaeger all-in-one container.
+** `reporter.grpc.tls.ca`: the location of the Jaeger collector CA certificate. The certificate is mounted from a configmap. The configmap is created as part of the Jaeger installation.
+** `reporter.grpc.tls.server-name`: the server name of the Jaeger collector for TLS identification. This corresponds to the fully qualified name of the Jaeger collector. 
++
+* Use the following `oc patch` command to inject the sidecar into the responder service deploymentconfig:
++
+----
+$ oc patch dc responder-service --type='json' -p '[{"op": "add", "path": "/spec/template/spec/containers/1", value: {"name": "jaeger-agent", "ports": [{"name": "zk-compact-trft",  "containerPort": 5775, "protocol": "UDP"},{"name": "config-rest", "containerPort": 5778, "protocol": "TCP"},{"name": "jg-compact-trft", "containerPort": 6831, "protocol": "UDP"},{"name": "jg-binary-trft", "containerPort": 6832, "protocol": "UDP"},{"name": "admin-http", "containerPort": 14271, "protocol": "TCP"}],"imagePullPolicy": "IfNotPresent", "volumeMounts": [{"name": "jaeger-service-ca", "readOnly": true, "mountPath": "/etc/pki/ca-trust/source/service-ca"}], "image": "registry.redhat.io/distributed-tracing/jaeger-agent-rhel8:1.20", "args": ["--reporter.grpc.host-port=jaeger-collector-headless:14250", "--reporter.type=grpc", "--reporter.grpc.tls.ca=/etc/pki/ca-trust/source/service-ca/service-ca.crt", "--reporter.grpc.tls.enabled=true", "--reporter.grpc.tls.server-name=jaeger-collector-headless.user1-tracing.svc.cluster.local"]}}, {"op": "add", "path": "/spec/template/spec/volumes/1", "value": {"name": "jaeger-service-ca", "configMap": {"name": "jaeger-service-ca", "items": [{"key": "service-ca.crt", "path": "service-ca.crt"}], "defaultMode": 420}} }]' -n user1-tracing
+----
++
+.Output
+----
+deploymentconfig.apps.openshift.io/responder-service patched
+----
+* The responder service is redeployed as a result of the `oc patch` command. Once redeployed, verify that the responder service pod consists of 2 containers: 
++
+----
+$ oc get pods -n user1-tracing | grep responder-service
+----
++
+.Sample Output
+----
+responder-service-1-deploy                       0/1     Completed   0          76m
+responder-service-2-deploy                       0/1     Completed   0          3m53s
+responder-service-2-h65ns                        2/2     Running     0          3m49s
+----
+
+. Build the responder service application, create an image and push the image to the OpenShift registry:
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-tracing/responder-service:tracing .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-tracing/responder-service:tracing
+----
+
+. Patch the responder service deploymentconfig to point to the `tracing` tag of the `responder-service` imagestream:
++
+----
+$ oc patch dc responder-service --type='json' -p '[{"op": "replace", "path": "/spec/triggers/1/imageChangeParams/from/name", "value": "responder-service:tracing"}]' -n user1-tracing
+----
++
+This forces a redeployment of the responder service.
+
+. Obtain the URL to the responder service application:
++
+----
+$ RESPONDER_SERVICE_URL=$(oc get route responder-service -n user1-tracing --template='{{ .spec.host }}')
+----
+
+. Use `curl` to invoke the REST API of the responder service.
++
+----
+$ curl -v -X GET http://${RESPONDER_SERVICE_URL}/responders
+----
++
+.Sample Output
+----
+Note: Unnecessary use of -X or --request, GET is already inferred.
+*   Trying 18.194.125.175:80...
+* Connected to responder-service-user2-tracing.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 80 (#0)
+> GET /responders HTTP/1.1
+> Host: responder-service-user2-tracing.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< content-length: 2
+< content-type: application/json
+< set-cookie: dd29235929926c9c9091fa59765ee8dd=4e3ff293796e86370f213a75ee2c382a; path=/; HttpOnly
+< cache-control: private
+< 
+* Connection #0 to host responder-service-user2-tracing.apps.cluster-03b3.03b3.example.opentlc.com left intact
+[]
+----
++
+Repeat the `curl` command a couple of times.
+
+. Check the logs of the responder service. Notice the log statements of the Jaeger spans:
++
+----
+2020-07-24 12:11:08,497 INFO  [io.jae.int.rep.LoggingReporter] (executor-thread-1) Span reported: f35789a1274d589a:f35789a1274d589a:0:1 - GET:com.redhat.erdemo.responder.rest.ResponderResource.allResponders
+2020-07-24 12:13:13,041 INFO  [io.jae.int.rep.LoggingReporter] (executor-thread-1) Span reported: 669ce92cadd892f5:669ce92cadd892f5:0:1 - GET:com.redhat.erdemo.responder.rest.ResponderResource.allResponders
+2020-07-24 12:13:13,955 INFO  [io.jae.int.rep.LoggingReporter] (executor-thread-1) Span reported: 55822119569f6605:55822119569f6605:0:1 - GET:com.redhat.erdemo.responder.rest.ResponderResource.allResponders
+----
+
+. In a browser window, navigate to the Jaeger UI.  Notice that `responder-service` is present in the _Service_ drop down box:
++
+image::images/jaeger-service-responder-service.png[]
+
+. Select `responder-service` and click _Find Traces_. Expect to see some traces appearing:
++
+image::images/jaeger-responder-service-traces.png[]
++
+Every trace consists of 1 span. This is the span that was automatically created by the implicit instrumentation of the REST layer of the application by the Quarkus OpenTracing extension.
+
+. Click on one of the traces to see the details.
++
+image::images/jaeger-responder-service-traces-details.png[]
++
+Notice the different tags added to the trace by the instrumentation code.
+
+. The Quarkus OpenTracing extensions also comes with automatic tracing of the JDBC layer. To enable it, a number of changes are required:
+* Add a dependency to `io.opentracing.contrib:opentracing-jdbc` in the `pom.xml` file of the responder service project:
++
+----
+<dependency>
+    <groupId>io.opentracing.contrib</groupId>
+    <artifactId>opentracing-jdbc</artifactId>
+</dependency>
+----
+* The JDBC instrumentation library uses its own database driver as a wrapper around the real driver, so you need to configure your datasource and Hibernate to use it. In the `src/main/resources/application.properties` configuration file, add the following settings:
++
+----
+quarkus.datasource.jdbc.driver=io.opentracing.contrib.jdbc.TracingDriver
+quarkus.hibernate-orm.dialect=org.hibernate.dialect.PostgreSQLDialect
+----
+* In the `responder-service` configmap in the `user1-tracing` namespace, change the  database connection URL to the following value:
++
+----
+quarkus.datasource.jdbc.url=jdbc:tracing:postgresql://postgresql.user1-tracing.svc:5432/emergency_response_demo
+----
+
+. Build the responder service application, create an image and push the image to the OpenShift registry:
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-tracing/responder-service:tracing .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-tracing/responder-service:tracing
+----
+
+. Wait until the responder service service is redeployed. Repeat the curl command to the responder service REST API. Check the trace logs in the logs of the responder service pod. Check the traces in the Jaeger UI. Expect the last traces to consist of two spans.
++
+image::images/jaeger-responder-service-traces-2.png[]
++
+image::images/jaeger-responder-service-traces-details-2.png[]
++
+The JAX-RS trace now has a child trace for the JDBC call executed as part of the implementation of the REST endpoint.
+
+. In the responder service, new responders are created through a POST REST call. As a result of the creation of a responder, a _ResponderCreatedEvent_ Kafka message is posted to the `topic-responder` topic. 
+* Create a payload for the REST call, and call the responder service to create a new responder:
++
+----
+$ echo '
+{
+  "name": "John Doe",
+  "phoneNumber": "111-222-333",
+  "latitude": 36.17972,
+  "longitude": -74.99047,
+  "boatCapacity": 6,
+  "medicalKit": false,
+  "available": true,
+  "enrolled": false,
+  "person": false
+}
+' | tee /tmp/create-responder.json
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/create-responder.json http://${RESPONDER_SERVICE_URL}/responder
+----
++
+.Sample output
+----
+Note: Unnecessary use of -X or --request, POST is already inferred.
+*   Trying 18.158.125.5:80...
+* Connected to responder-service-user2-tracing.apps.cluster-03b3.03b3.example.opentlc.com (18.158.125.5) port 80 (#0)
+> POST /responder HTTP/1.1
+> Host: responder-service-user2-tracing.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> Content-type: application/json
+> Content-Length: 201
+> 
+* upload completely sent off: 201 out of 201 bytes
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 201 Created
+< content-length: 0
+< set-cookie: dd29235929926c9c9091fa59765ee8dd=98461e57189b5fe43c52b0c8d46eb2ea; path=/; HttpOnly
+< 
+* Connection #0 to host responder-service-user2-tracing.apps.cluster-03b3.03b3.example.opentlc.com left intact
+----
+* Repeat the REST call a couple of times.
+* Check the traces in the Jaeger UI. Expect to find traces for the REST POST call, and a child trace for the JDBC insert operation. However, the trace is not propagated any further.
++
+image::images/jaeger-responder-service-traces-details-3.png[]
++
+This is expected, as Quarkus does not (yet) provide integration between tracing and Reactive Messaging.
+
+=== Propagate Traces through Kafka
+
+The OpenTracing _contrib_ project - which hosts most integrations between OpenTracing and third party frameworks and technology has a project for integration with Kafka. However, to use this integration library you need access to Kafka API objects like `KafkaConsumer` and `KafkaProducer` to add tracing instrumentation. In Quarkus however, the Kafka API objects are completely abstracted by the Reactive Messaging framework, which means you have to resort to explicit instrumentation in code. You can however reuse some of the functionality of the OpenTracing `opentracing-kafka-client` library.
+
+. Add a dependency to `io.opentracing.contrib:opentracing-kafka-client:0.1.13` in the `pom.xml` file of the responder service project:
++
+----
+<dependency>
+    <groupId>io.opentracing.contrib</groupId>
+    <artifactId>opentracing-kafka-client</artifactId>
+   <version>0.1.13</version>
+</dependency>
+----
+. Start with outgoing Kafka massages. In the responder service these are handled in the `EventPublisher` class. In order to propagate the traces you need to create a child trace of the currently active trace (or just a new trace if there is no currently active trace) and inject that trace into the headers of the outgoing Kafka message.
+* Create a class `com.redhat.erdemo.responder.tracing.TracingKafkaUtils`. Create a static method `buildAndInjectSpan`:
++
+----
+    public static void buildAndInjectSpan(KafkaRecord<String, String> record, Tracer tracer) {
+        Tracer.SpanBuilder spanBuilder = tracer.buildSpan("To_" + record.getTopic()).withTag(Tags.SPAN_KIND.getKey(), Tags.SPAN_KIND_PRODUCER).withTag("key", record.getKey());
+
+        Span active = tracer.activeSpan();
+        if (active != null) {
+            spanBuilder.asChildOf(active);
+        }
+        Span span = spanBuilder.start();
+        span.finish();
+        io.opentracing.contrib.kafka.TracingKafkaUtils.inject(span.context(),record.getHeaders(), tracer );
+    }
+----
++
+This code uses the OpenTracing API to build a new Span as a child span of the currently active span, and injects that span in the headers of the outgoing Kafka message. +
+Make sure to use the API classes from the `io.opentracing` package.
+* In the `EventPublisher` class, inject a reference to the global `io.opentracing.Tracer` instance. Also inject the configuration property `mp.messaging.outgoing.responder-event.topic`, whose value is the name of the topic outgoing messages are sent to:
++
+----
+    @Inject
+    Tracer tracer;
+
+    @ConfigProperty(name = "mp.messaging.outgoing.responder-event.topic")
+    String responderEventTopic;
+----
+* Still in the `EventPublisher` class, modify the `toMessage` method to inject a span in the outgoing Kafka message:
++
+----
+    private org.eclipse.microprofile.reactive.messaging.Message<String> toMessage(Pair<String, Message<?>> pair) {
+        KafkaRecord<String, String> record = KafkaRecord.of(responderEventTopic, pair.getLeft(), Json.encode(pair.getRight()));
+        TracingKafkaUtils.buildAndInjectSpan(record, tracer);
+        return record;
+    }
+----
+
+. Add the following configuration property to `src/test/resources/application.properties` to prevent the unit tests from failing:
++
+----
+mp.messaging.outgoing.responder-event.topic=test-topic
+----
+
+. Build the responder service application, create an image and push the image to the OpenShift registry:
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-tracing/responder-service:tracing .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-tracing/responder-service:tracing
+----
+
+. To demonstrate trace propagation through Kafka, you can deploy an instrumented version of the Kafka consumer app, which is instrumented for tracing.
+* Add the following configuration properties to the `kafka-consumer-app` configmap in the `user1-tracing` namespace:
++
+----
+quarkus.jaeger.endpoint=http://jaeger-collector:14268/api/traces
+quarkus.jaeger.reporter-log-spans=true
+quarkus.jaeger.sampler-type=probabilistic
+quarkus.jaeger.sampler-param=1
+quarkus.jaeger.service-name=kafka-consumer-app
+----
++
+Notice that the traces from the Kafka consumer app will be sent directly to the Jaeger collector, without using the Jaeger agent.
+* Deploy an instrumented version of the Kafka consumer app, which is instrumented for tracing:
++
+----
+$ oc patch dc kafka-consumer-app --type='json' -p '[{"op": "replace", "path": "/spec/triggers/1/imageChangeParams/from/name", "value": "kafka-consumer-app:tracing"}]' -n user1-tracing
+----
+
+. Using the payload and the `curl` command you used before, create a couple of responders. 
+* Check the logs of the responder service. Notice the logs for the traces injected in the outgoing Kafka message:
++
+----
+2020-07-24 18:39:26,690 INFO  [io.jae.int.rep.LoggingReporter] (executor-thread-1) Span reported: 14956c28b943b4b1:82badc00841dfaef:14956c28b943b4b1:1 - To_topic-responder-event
+2020-07-24 18:39:26,692 INFO  [io.jae.int.rep.LoggingReporter] (executor-thread-1) Span reported: 14956c28b943b4b1:443fade1b38434ac:14956c28b943b4b1:1 - Update
+2020-07-24 18:39:26,694 INFO  [io.jae.int.rep.LoggingReporter] (executor-thread-1) Span reported: 14956c28b943b4b1:14956c28b943b4b1:0:1 - POST:com.redhat.erdemo.responder.rest.ResponderResource.createResponder
+2020-07-24 18:39:27,439 INFO  [io.jae.int.rep.LoggingReporter] (executor-thread-1) Span reported: 1384114688a2e76a:2f5d93d2115088bd:1384114688a2e76a:1 - To_topic-responder-event
+2020-07-24 18:39:27,441 INFO  [io.jae.int.rep.LoggingReporter] (executor-thread-1) Span reported: 1384114688a2e76a:448d9c4d9c43dd61:1384114688a2e76a:1 - Update
+2020-07-24 18:39:27,443 INFO  [io.jae.int.rep.LoggingReporter] (executor-thread-1) Span reported: 1384114688a2e76a:1384114688a2e76a:0:1 - POST:com.redhat.erdemo.responder.rest.ResponderResource.createResponder
+----
+
+. Check the traces in the Jaeger UI. Notice that the traces are now propagated to the Kafka consumer app:
++
+image::images/jaeger-responder-service-traces-4.png[]
++
+image::images/jaeger-responder-service-traces-details-4.png[]
+
+. Check the logs of the kafka consumer app. Notice the `uber-trace-id` header, which represents the span being propagated as Kafka message header.
++
+----
+2020-07-24 18:56:15,473 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-9) Consumed message from topic 'topic-responder-event', partition '10', offset '1'
+2020-07-24 18:56:15,473 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-9)     Headers: uber-trace-id: 4d122bffd16a639a:c9e20dd6e60ce332:4d122bffd16a639a:1
+2020-07-24 18:56:15,473 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-9)     Message key: 19
+2020-07-24 18:56:15,473 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-9)     Message value: {"id":"da673502-66f4-41a0-a44c-429fd7c8840f","messageType":"RespondersCreatedEvent","invokingService":"ResponderService","timestamp":1595616975468,"header":{},"body":{"created":1,"responders":[19]}}
+2020-07-24 18:56:15,473 INFO  [io.jae.int.rep.LoggingReporter] (Thread-9) Span reported: 4d122bffd16a639a:451e8a6a0e60434c:23d470f5dd03897b:1 - logMessage
+2020-07-24 18:56:16,187 INFO  [io.jae.int.rep.LoggingReporter] (Thread-10) Span reported: ec9489061f290237:a51df7f81f7255b3:b31a47b9654f661:1 - FROM_topic-responder-event
+----
+
+. Next step is adding the ability to the responder service to extract and propagate traces from incoming Kafka messages.
+* In the `TracingKafkaUtils` class, add the following method:
++
+----
+    public static Span buildChildSpan(String operationName, IncomingKafkaRecord<String, String> record, Tracer tracer) {
+
+        SpanContext parentContext = io.opentracing.contrib.kafka.TracingKafkaUtils.extractSpanContext(record.getHeaders(), tracer);
+
+        String consumerOperation = "FROM_" + record.getTopic();
+        Tracer.SpanBuilder spanBuilder = tracer
+                .buildSpan(consumerOperation)
+                .ignoreActiveSpan()
+                .withTag(Tags.SPAN_KIND.getKey(), Tags.SPAN_KIND_CONSUMER);
+
+        if (parentContext != null) {
+            spanBuilder.addReference(References.FOLLOWS_FROM, parentContext);
+        }
+
+        Span span = spanBuilder.start();
+        span.setTag("partition", record.getPartition())
+                .setTag("topic", record.getTopic())
+                .setTag("offset", record.getOffset())
+                .setTag("key", record.getKey())
+                .setTag(Tags.PEER_SERVICE.getKey(), "kafka");
+        span.finish();
+
+        //Create new child span
+        return tracer.buildSpan(operationName).ignoreActiveSpan()
+                .withTag(Tags.SPAN_KIND.getKey(), Tags.SPAN_KIND_CONSUMER)
+                .asChildOf(span).startActive(true).span();
+    }
+----
++
+This method uses the OpenTracing API to extract the span from the headers of the incoming message. It then creates a child span which is tagged with metadata such as the topic, partition and offset. Finally a child span is created and activated. This will be the active span for the code executed when a message is consumed.
+* In the `ResponderUpdateCommandSource` class, inject the global tracer:
++
+----
+    @Inject
+    Tracer tracer;
+----
+* Still in the `ResponderUpdateCommandSource` class, modify the `onMessage` method to wrap the method execution in the active span:
++
+----
+    @Incoming("responder-command")
+    @Acknowledgment(Acknowledgment.Strategy.MANUAL)
+    public CompletionStage<CompletionStage<Void>> onMessage(IncomingKafkaRecord<String, String> message) {
+
+        return CompletableFuture.supplyAsync(() -> {
+            Span span = TracingKafkaUtils.buildChildSpan("updateResponderCommand", message, tracer);
+            try {
+                acceptMessage(message.getPayload()).ifPresent(j -> processMessage(j, message.getTopic(), message.getPartition(), message.getOffset()));
+            } catch (Exception e) {
+                log.error("Error processing msg " + message.getPayload(), e);
+            };
+            span.finish();
+            return message.ack();
+        });        
+    }
+----
+* Repeat for the `ResponderLocationUpdatedSource` class.
+
+. Build the responder service application, create an image and push the image to the OpenShift registry.
+
+. Do a `curl` call to the `GET /responders` endpoint of the responder service, and pick an ID of one of the responders.
+
+. Send a message to the `topic-responder-command` topic to update the responder. Make sure the responder ID matches an existing responder:
++
+----
+$ echo '
+{
+  "key":"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43",
+  "value":{
+    "messageType" : "UpdateResponderCommand",
+    "id":"messageId",
+    "invokingService":"test",
+    "timestamp":1521148332397,
+    "header": {"incidentId": "829fce70-83ae-49dd-b0dc-6dfbdfd7dc43"},
+    "body": {
+      "responder": {
+        "id": "3",
+        "available": false
+      }
+    }
+  }  
+}
+' | tee /tmp/update-responder.json
+$ KAFKA_PRODUCER_APP=http://$(oc get route kafka-producer-app -n user1-tracing --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/update-responder.json ${KAFKA_PRODUCER_APP}/produce
+----
++
+Repeat the `curl` call a couple of times.
+
+. Check the logs of the responder service. Notice the logs for the traces created from the incoming Kafka message:
++
+----
+
+2020-07-24 21:06:54,889 INFO  [io.jae.int.rep.LoggingReporter] (Thread-10) Span reported: 7ac2331c960e4fee:7ac2331c960e4fee:0:1 - FROM_topic-responder-command
+2020-07-24 21:06:54,892 INFO  [io.jae.int.rep.LoggingReporter] (Thread-10) Span reported: 7ac2331c960e4fee:e793f42c665f56af:3fb907e120407a72:1 - Query
+2020-07-24 21:06:54,894 INFO  [io.jae.int.rep.LoggingReporter] (Thread-10) Span reported: 7ac2331c960e4fee:c7832cda240f5c7a:3fb907e120407a72:1 - Query
+2020-07-24 21:06:54,895 INFO  [io.jae.int.rep.LoggingReporter] (Thread-10) Span reported: 7ac2331c960e4fee:9b540394e23fc03:3fb907e120407a72:1 - To_topic-responder-event
+2020-07-24 21:06:54,896 INFO  [io.jae.int.rep.LoggingReporter] (Thread-10) Span reported: 7ac2331c960e4fee:3fb907e120407a72:7ac2331c960e4fee:1 - responderUpdateCommand
+----
+
+. Check the traces in the Jaeger UI. Notice that the traces are now initiated from the consumption of the message and propagated to the Kafka consumer app:
++
+image::images/jaeger-responder-service-traces-5.png[]
++
+image::images/jaeger-responder-service-traces-details-5.png[]
+
+=== Add Tags and Baggage to Traces
+
+The OpenTracing API provides 2 ways to enrich traces with contextual information: tags and baggage. The difference between both is that tags are added to the span, but are not propagated. Baggage items on the other hand are propagated together with the span to upstream services.
+
+. Add a tag for the responder ID to the active span when a responder is updated. Add the following code to the `processMessage` method of the `ResponderUpdateCommandSource` class:
++
+----
+    private void processMessage(JsonObject json, String topic, int partition, long offset) {
+        JsonObject responderJson = json.getJsonObject("body").getJsonObject("responder");
+        Responder responder = fromJson(responderJson);
+
+        if (tracer.activeSpan() != null) {
+            tracer.activeSpan().setTag("responderId", responder.getId());
+        }
+
+        [...]
+----
+
+. Build the responder service application, create an image and push the image to the OpenShift registry.
+
+. Do a `curl` call to the `GET /responders` endpoint of the responder service, and pick an ID of one of the responders.
+
+. Send a message to the `topic-responder-command` topic to update the responder. Make sure the responder ID matches an existing responder:
++
+----
+$ echo '
+{
+  "key":"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43",
+  "value":{
+    "messageType" : "UpdateResponderCommand",
+    "id":"messageId",
+    "invokingService":"test",
+    "timestamp":1521148332397,
+    "header": {"incidentId": "829fce70-83ae-49dd-b0dc-6dfbdfd7dc43"},
+    "body": {
+      "responder": {
+        "id": "3",
+        "available": false
+      }
+    }
+  }  
+}
+' | tee /tmp/update-responder.json
+$ KAFKA_PRODUCER_APP=http://$(oc get route kafka-producer-app -n user1-tracing --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/update-responder.json ${KAFKA_PRODUCER_APP}/produce
+----
++
+Repeat the `curl` call a couple of times.
+
+. Check the traces in the Jaeger UI. Notice that the `updateResponderCommand` spans now have an extra tag with the responder ID.
++
+image::images/jaeger-responder-service-traces-details-6.png[]
+
+. Change the code in the `processMessage` method of the `ResponderUpdateCommandSource` class to set the responder ID as a baggage item rather than a tag:
++
+----
+    private void processMessage(JsonObject json, String topic, int partition, long offset) {
+        JsonObject responderJson = json.getJsonObject("body").getJsonObject("responder");
+        Responder responder = fromJson(responderJson);
+
+        if (tracer.activeSpan() != null) {
+            tracer.activeSpan().setBaggageItem("responderId", responder.getId());
+        }
+
+        [...]
+----
+
+. Build the responder service application, create an image and push the image to the OpenShift registry.
+
+. Send a couple of messages to the `topic-responder-command` topic to update the responder.
+
+. Check the traces in the Jaeger UI. Notice the log statement in the `updateResponderCommand` spans logging the baggage item that was added to the spans.
++
+image::images/jaeger-responder-service-traces-details-7.png[]
+
+. Check the logs of the Kafka consumer app. Notice the `uberctx-responderId` header which represents the baggage item  which is propagated together with the span itself.
++
+----
+2020-07-26 06:18:50,226 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-37) Consumed message from topic 'topic-responder-event', partition '8', offset '24'
+2020-07-26 06:18:50,226 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-37)     Headers: uber-trace-id: 193fafee2f3e0a4b:99de84b66f794979:165dc69cf059ce6c:1, uberctx-responderId: 3
+2020-07-26 06:18:50,226 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-37)     Message key: 3
+2020-07-26 06:18:50,226 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-37)     Message value: {"id":"dc57dfda-7661-4f52-9d25-251c4a83038e","messageType":"ResponderUpdatedEvent","invokingService":"ResponderService","timestamp":1595744330222,"header":{"incidentId":"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43"},"body":{"status":"error","statusMessage":"Responder state not changed","responder":{"id":"3","name":null,"phoneNumber":null,"latitude":null,"longitude":null,"boatCapacity":null,"medicalKit":null,"available":false,"person":null,"enrolled":null}}}
+----
+
+== Apply End To End Tracing to the Emergency Response Application
+
+Instrumenting all the services that make up the Emergency Response application is beyond the scope of this lab. However, the Emergency Response Ansible installer has a role that applies tracing to the most important services of the application.
+
+The instructions below assume that you have installed the Emergency Response application in the `user1-er-demo` namespace. If this is not the case, adjust the instructions.
+
+. Make sure you are logged in the OpenShift cluster as a user with admin privileges.
+. Check out the Ansible installer for the Emergency Response application. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+. Execute the `install_tracing.yml` playbook on the Emergency Response installation in the `user1-er-demo` namespace.
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/install_tracing.yml -e project_admin=user1
+----
++
+The playbook installs the Jaeger infrastructure components in the `user1-er-metrics` namespace. It adds tracing functionality to the main services of the Emergency Response application by redeploying the services using an image with an instrumented version of the code. The playbook also injects the Jaeger agent in each of the instrumented services.
+
+. Wait until the services have redeployed. This can take some minutes.
+
+. In a browser window, navigate to the Emergency Response application console, log in as _incident_commander_, and start a simulation.
+
+. Obtain the URL to the Jaeger UI:
++
+----
+$ JAEGER_URL=https://$(oc get route jaeger -n user1-er-metrics --template='{{ .spec.host }}')
+echo $JAEGER_URL
+----
+
+. In a browser window, navigate to the Jaeger UI. Log in with your OpenShift credentials. Select `incident-service` from the _Services_ drop-down box and click _Find Traces_. Expect to see some traces appearing:
++
+image::images/jaeger-emergency-response-traces-2.png[]
++
+Notice that the traces consists of several spans, sometimes more than three hundred per request to the incident service.
++
+Open the details page of on of the traces to get an idea of how events flow through the application.
++
+image::images/jaeger-responder-service-traces-details-8.png[]
+
+== Tear Down the Development Environment
+
+In order to free up resources on the OpenShift cluster, you can tear down the environment you deployed in the first step of the lab. +
+To do so, execute the following Ansible commands:
+
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_consumer_app.yml -e project_admin=user1 -e project_name=tracing -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_producer_app.yml -e project_admin=user1 -e project_name=tracing -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/responder_service.yml -e project_admin=user1 -e project_name=tracing -e ACTION=uninstall 
+$ ansible-playbook -i inventories/inventory playbooks/postgresql.yml -e project_admin=user1 -e project_name=tracing -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=tracing -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=tracing -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=tracing -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/jaeger.yml -e project_admin=user1 -e namespace_monitoring=user1-tracing -e ACTION=uninstall
+----

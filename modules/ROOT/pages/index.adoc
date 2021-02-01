@@ -1,0 +1,182 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== Lab Environment
+
+=== Set Up Local Workstation
+
+Your guid is vale
+
+The labs of this course are to be performed on your local workstation and on an OpenShift cluster.
+
+The instructions in the labs have been written on a Linux workstation. However they should work on a Mac too. None of the instructions have been tested on Windows, and they are not expected to work. If you have a Windows workstation, please install a Linux virtual machine to do the labs.
+
+In order to be able to do the labs, you need a number of tools and utilities installed on your workstation. These tools include:
+
+* Java development environment (JDK) for Java 11. Other versions of Java have not been tested.
+* Integrated Development Environment (IDE). Any modern Java IDE will do. You can use VS Code, IntelliJ or Eclipse. Make sure your IDE is set up for Java 11.
+* Ansible version >= 2.9.0
+* Tools for container image management. On Linux, use Podman. Mac users can use Docker.
+* API Testing: Postman (https://www.postman.com)
+* OpenShift `oc` client version 4.6.x
+* Maven version 3.6.3 (https://maven.apache.org/download.cgi)
+* Git
+
+=== OpenShift Cluster
+
+An OpenShift cluster has been provisioned for you. Your instructor will communicate you the details of the cluster in a separate communication.
+
+You have cluster admin access to this cluster.
+
+=== Emergency Response Demo
+
+The labs in this course are built around the Emergency Response application, a demo application aiming at showcasing the breadth of the Red Hat Middleware portfolio running on Red Hat OpenShift.
+
+The Emergency Response demo is designed as a distributed, cloud-native and mostly event-driven distributed application. The services of the Emergency Response Demo application use a mix of HTTP-based synchronous communication and AMQ Streams-based asynchronous communication.
+
+More details about the Emergency Response application can be found at https://www.erdemo.io.
+
+The Emergency Response application has been installed on the OpenShift cluster assigned to you for this course. Refer to the appendix for instructions on how to install the demo in your own environment.
+
+As part of the lab instructions, you will be instructed to run a simulation on the Emergency Response application.
+
+To run a simulation on the Emergency Response application:
+
+. Make sure you are logged in to the OpenShift cluster.
+. Obtain the URL to the Emergency Response console.
++
+----
+$ echo https://$(oc get route emergency-console -o template --template={{.spec.host}} -n user1-er-demo)
+----
+. Open a browser window, and navigate to the URL of the Emergency Response console. Expect to see a login screen.
++
+image::images/emergency-response-login.png[]
+. Login as `incident_commander/r3dh4t1!`. You are redirected to the home page of the application
++
+image::images/emergency-response-home-page.png[]
+. Click on the _Dashboard_ link to navigate to the main dashboard of the console.
++
+image::images/emergency-response-dashboard.png[]
+. Click the blue _Start Simulation_ to start a simulation.
++
+image::images/emergency-response-simulation-start.png[]
+. As part of the simulation, 10 responders are generated, as well as 15 incidents. The incidents are assigned to responders, which start to move towards their assigned incident, and then to the designated shelter. The location of the incidents and the movement of the responders can be followed on the map.
++
+image::images/emergency-response-simulation.png[]
++
+Clicking on one of the incident or responder icons, will show details about the incident or responder, and show the route the responder is following.
++
+image::images/emergency-response-simulation-details.png[]
+
+. When all the incidents are rescued and the evacuees dropped off at a shelter, the simulation is finished.
++
+image::images/emergency-response-simulation-terminated.png[]
++
+Please note that this will take several minutes.
+
+=== Emergency Response Ansible Installer
+
+As part of the labs of this course, you will be asked to install operators, infrastructure components and applications. For most of these tasks, an Ansible playbook is provided. The procedure to follow to run these playbooks is as follows:
+
+. Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file:
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+
+. The above steps must only be done once. So if lab instructions state to clone the install repository and copy the inventory template file, you can safely ignore these instructions if you have done them as part of an earlier lab.
+
+. Run the playbook command as given in the instructions. Most playbooks take a number of parameters. Make sure to apply them exactly as stated in the instructions.
+
+. The playbooks used in this course should run without errors. This can be verified by looking at the final output of the command, which should look like this:
++
+----
+PLAY RECAP ********************************************************************************************************************************************
+localhost                  : ok=34   changed=30   unreachable=0    failed=0    skipped=2    rescued=0    ignored=0
+----
++
+The value of `failed` should be zero after running the playbook. If this is not the case, try to find the root cause of the error, fix it and run the playbook again. All playbooks used in this course are idempotent, so they can be run several times.
+
+=== Note for Mac users
+
+The instructions in this course have been written with a Linux workstation in mind, but should work equally well on a Mac. One area of variance is the use of Podman. In this course, Podman is used to build images on your local workstation and push the images to the Openshift registry. For Mac users, substitute `podman` with `docker` every time you see a command using Podman.
+
+:!numbered:
+
+== Appendix
+
+=== Install the Emergency Response application
+
+The Emergency Response application can be installed on an OpenShift Container Platform (OCP) 4.x environment. At the time of writing the OpenShift version used for the course is 4.4.8.
+
+Openshift requirements::
+* OCP Version: 4.6
+* Memory: 24 GBi allocated to one or more worker nodes
+* CPU: 10 cores allocated to one or more worker nodes
+* Disk: 50 GB of storage that supports Read Write Once (RWO).
++
+The Emergency Response application currently does not require Read-Write-Many (RWX).
+* Credentials: You will need _cluster-admin_ credentials to your OpenShift environment for the installation.
+* CA signed certificate: Optional +
++
+Preferably, all public routes of your Emergency Response application utilize a SSL certificate signed by a legitimate certificate authority, ie: LetsEncrypt
+* Pull Secret: Some Linux container images used in the Emergency Response application reside in the following secured image registry: _registry.redhat.io_. Those images will need to be pulled to your OpenShift 4 environment. As part of the installation of OCP4, you should have already been prompted to provide your pull secret that enables access to various secured registries including registry.redhat.io.
+
+The installation of the Emergency Response demo is done using Ansible.
+
+The Emergency Response application makes use of a third-party SaaS API called MapBox. MapBox APIs provide the Emergency Response application with an optimized route for a responder to travel given pick-up and drop-off locations. To invoke its APIs, MapBox requires an access token. For normal use of the Emergency Response application the free-tier account provides ample rate-limits.
+
+In order to obtain a token from MapBox, you need to sign up with their service at link:www.mapbox.com[].
+
+image::images/mapbox-token.png[]
+
+Installation::
+. Make sure you are logged with the `oc` utility in the OpenShift cluster as a user with cluster-admin privileges.
+. Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file:
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+. In the `inventory` inventory file, replace the `replaceme` value of the _mapbox_token_ field with your MapBox token.
++
+----
+[all:vars]
+# MapBox API token, see https://docs.mapbox.com/help/how-mapbox-works/access-tokens/
+map_token=pk.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890.abcdefghijklmnopqrstuvwxyz
+----
+. The Emergency Response application will be owned by a non cluster-admin _project administrator_. In your OpenShift environment, you will need one or more non cluster-admin users to serve this purpose.
++
+Set an environment variable to the value of the non cluster-admin user.
++
+----
+$ OCP_USERNAME=user1
+----
+. Install the Emergency Response application:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/install.yml -e project_admin=$OCP_USERNAME
+----
++
+After about 20 minutes, you should see ansible log messages similar to the following:
++
+----
+PLAY RECAP ********************************************************************************
+localhost : ok=432  changed=240  unreachable=0    failed=0    skipped=253  rescued=0    ignored=0 
+----
+
+. The Emergency Response demo is installed in the `$OCP_USERNAME-er-demo` namespace.

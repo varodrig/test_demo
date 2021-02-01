@@ -1,0 +1,12 @@
+assets: 
+  - name: terminal
+    method: image
+    source: quay.io/openshifthomeroom/workshop-terminal:latest
+    ports:
+      - "10080:10080"
+  - name: content
+    method: source
+    source: ../../build/site/content/1
+    ports:
+      - "8080:80"
+    dockerFile: ../docker_files/Dockerfile

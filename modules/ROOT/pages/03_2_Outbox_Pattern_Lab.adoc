@@ -1,0 +1,720 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== Outbox Pattern Lab
+
+.Prerequisites
+* Access to the Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6.x
+
+.Goals
+* Implement outbox pattern using Apache Kafka and Debezium
+
+:numbered:
+
+== Outbox Pattern
+
+*The issue of dual writes*
+
+In order to provide their functionality, microservices in a distributed application will typically have their own local data store. For instance, in an order processing system, the order service may use a relational database to persist the information about purchase orders. When a new order is placed, this may result in an INSERT operation in a table PurchaseOrder in the service’s database. At the same time, the service may wish to send an event about the new order to Apache Kafka, so to propagate that information to other interested services.
+
+Simply issuing these two requests may lead to potential inconsistencies, though. The reason being that we cannot have one shared transaction that would span the service’s database as well as Apache Kafka, as the latter doesn’t support to be enlisted in distributed (XA) transactions. So in unfortunate circumstances it might happen that we end up with having the new purchase order persisted in the local database, but not having sent the corresponding message to Kafka (e.g. due to some networking issue). Or, the other way around, we might have sent the message to Kafka but failed to persist the purchase order in the local database. Both situations are undesirable; this may cause no shipment to be created for a seemingly successfully placed order. Or a shipment gets created, but then there’d be no trace about the corresponding purchase order in the order service itself.
+
+So how can this situation be avoided? The answer is to only modify one of the two resources (the database or Apache Kafka) and drive the update of the second one based on that, in an eventually consistent manner. This is where the outbox pattern comes in: the microservice would only write to the database synchronously and this write drives the export of a message to Apache Kafka.
+
+*The outbox pattern*
+
+The idea of this approach is to have an _outbox_ table in the service’s database. When receiving a request for placing a purchase order, not only an INSERT into the PurchaseOrder table is done, but, as part of the same transaction, also a record representing the event to be sent is inserted into that outbox table.
+
+The record describes an event that happened in the service, for instance it could be a JSON structure representing the fact that a new purchase order has been placed with all necessary contextual information.
+
+An asynchronous process monitors that table for new entries. If there are any, it propagates the events as messages to Apache Kafka. This gives us a very nice balance of characteristics: by synchronously writing to the PurchaseOrder table, the source service benefits from _read your own writes_ semantics. A subsequent query for purchase orders will return the newly persisted order, as soon as that first transaction has been committed. At the same time, we get reliable, asynchronous, eventually consistent data propagation to other services via Apache Kafka.
+
+Log-based Change Data Capture (CDC) is a great fit for capturing new entries in the outbox table and stream them to Apache Kafka. As opposed to any polling-based approach, event capture happens with a very low overhead in near-realtime. Debezium comes with CDC connectors for several databases such as MySQL, PostgreSQL and SQL Server. In the case of PostgreSQL for example, Debezium tails the PostgreSQL transaction log (aka write-ahead log or WAL) to capture any new events in the outbox table and propagate them to Apache Kafka.
+
+*Outbox pattern in the Emergency Response application*
+
+The Emergency Response application makes heavy use of Apache Kafka to propagate events and commands between services. Some of these services, for example the incident service and the responder service, store state in a PostgreSQL database. These services are good potential candidates to implement the outbox pattern with Debezium.
+
+In this lab you will implement the outbox pattern on the incident service. In the incident service, new incidents are created and persisted in the database as the result of a REST POST call. Every time an incident is created, an _IncidentReportedEvent_ message is sent to Apache Kafka. More or less the same thing happens when updating incidents: the incident service listens for _UpdateIncidentCommand_ messages on a Kafka topic, and when consuming such a message, updates the incident in the database accordingly and sends an `IncidentUpdatedEvent` to Kafka.
+
+== Test Environment
+
+The first step in this lab consists of deploying a test environment on OpenShift. 
+The test environment includes the incident service, and its dependencies, namely an AMQ Streams cluster and a PostgreSQL database.
+You will also deploy a Kafka Connect instance with the Debezium PostgreSQL connector plug-in, as well as a couple of applications to validate the message flow to and from the incident service.
+You probably have done some of the steps already as part of previous labs, like cloning the Ansible installer for the Emergency Response demo. If this is the case, you can skip these steps.
+
+. Make sure you are logged in the OpenShift cluster as a user with admin privileges.
+. Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+
+. Deploy the AMQ Streams operator:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=outbox-test
+----
++
+This command deploys the AMQ Streams operator in the `user1-outbox-test` namespace. The scope of the operator is the namespace itself.
+
+. Deploy the AMQ Streams cluster:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=outbox-test -e zookeeper_storage_type=ephemeral -e kafka_storage_type=ephemeral
+----
++
+This command deploys a Kafka cluster consisting of 3 ZooKeeper nodes and 3 Kafka broker nodes in the `user1-outbox-test` namespace. Both Zookeeper and the Kafka brokers use ephemeral storage - which is perfectly acceptable in a short-lived development environment. 
+
+. Deploy the Kafka topics:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=outbox-test
+----
++
+This command deploys the Kafka topics used by the Emergency Response application. Every topic is created with 15 partitions and a replication factor of 3.
+
+. Verify the Kafka topics:
++
+----
+$ oc get kafkatopic -n user1-outbox-test
+----
++
+.Sample output
+----
+NAME                              PARTITIONS   REPLICATION FACTOR
+topic-incident-command            15           3
+topic-incident-event              15           3
+topic-mission-command             15           3
+topic-mission-event               15           3
+topic-responder-command           15           3
+topic-responder-event             15           3
+topic-responder-location-update   15           3
+----
+
+. Deploy an instance of Kafka Connect:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_connect.yml -e project_admin=user1 -e project_name=outbox-test
+----
++
+This command deploys an instance of Kafka Connect. The Kafka Connect image has the Debezium PostgreSQL connector plug-in (version 1.3.1.Final) already installed.
+
+. Deploy the PostgreSQL database. 
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/postgresql.yml -e project_admin=user1 -e project_name=outbox-test -e postgresql_storage_type=ephemeral -e postgresql_image=quay.io/btison/postgres-10-decoderbufs-fedora -e postgresql_imagestream_name=postgresql-debezium -e postgresql_imagestream_tag=v1.3.1.Final -e postgresql_conf_file=postgresql-replication.conf
+----
++
+This command deploys a PostgreSQL database. The PostgreSQL version is version 10. +
+The PostgreSQL image contains the _wal2json_ and Debezium _decoderbufs_ logical decoding output plug-ins, which are required for Debezium to read and process PostgreSQL database changes. For more details about these decoding plug-ins, refer to https://debezium.io/documentation/reference/connectors/postgresql.html. +
+When using PostgreSQL version 10 or later, Debezium can also use logical replication streaming using _pgoutput_. The _pgoutput_ module is available by default on PostgreSQL version 10 and later. When using the _pgoutput_ plug-in, additional plug-ins don't need to be installed on top of PostgreSQL. By default, Debezium uses the _decoderbufs_ plug-in. +
+PostgreSQL’s logical decoding uses replication slots. Check the contents of the `postgresql-conf` configmap for the replication slot settings used by PostgreSQL. +
+Replication requires a user with replication privileges. In a production environment you would set up a special user with this role, and configure the Debezium connector to use this user. In this lab however, the Debezium connector will use the built in `postgres` superuser. +
+As part of the deployment of the PostgreSQL instance, the Emergency Response database and tables are created using deployment pod-based lifecycle hooks.
+
+. Deploy the incident service
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/incident_service.yml -e project_admin=user1 -e project_name=outbox-test -e expose_service=true
+----
++
+This command deploys the incident service image and configures the application configuration configmap. The incident service is exposed through a route.
+
+. The Kafka consumer application is a simple Quarkus application that consumes messages from a given topic and logs the payload and metadata of each message to _stdout_. +
+Deploy the Kafka consumer application:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_consumer_app.yml -e project_admin=user1 -e project_name=outbox-test -e kafka_topic=topic-incident-event
+----
++
+The application is configured to consume messages from the `topic-incident-event` topic.
+
+. The Kafka producer application is a simple Quarkus application that exposes a REST endpoint and sends the payload of the REST call as a Kafka message to a given topic. +
+Deploy the Kafka producer application:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_producer_app.yml -e project_admin=user1 -e project_name=outbox-test -e kafka_topic=topic-incident-command
+----
++
+The application is configured to send messages to the `topic-incident-command` Kafka topic. The incident service consumes messages from this topic to update incident entities.
+
+. Wait until all deployed containers are up and running to validate the test environment. Create an incident with the _curl_ utility.
++
+----
+$ INCIDENT_SERVICE_URL=$(oc get route incident-service -n user1-outbox-test --template='{{ .spec.host }}')
+$ echo '
+{
+  "lat": 34.14338,
+  "lon": -77.86569,
+  "numberOfPeople": 3,
+  "medicalNeeded": true,
+  "victimName": "John Doe",
+  "victimPhoneNumber": "111-111-111"
+}
+' | tee /tmp/incident.json
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/incident.json "http://${INCIDENT_SERVICE_URL}/incidents"
+----
++
+The REST call should return a 200 response code. Check the logs of the kafka consumer app pod and expect to see the content of an `IncidentReportedEvent` message:
++
+.Example
+----
+2020-06-24 20:35:20,064 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-4) Consumed message from topic 'topic-incident-event', partition '1', offset '0'
+2020-06-24 20:35:20,065 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-4)     Headers:
+2020-06-24 20:35:20,065 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-4)     Message key: 27faf2ec-fbb8-41ed-ad49-61ce5c7495bd
+2020-06-24 20:35:20,065 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-4)     Message value: {"body":{"id":"27faf2ec-fbb8-41ed-ad49-61ce5c7495bd","lat":34.14338,"lon":-77.86569,"medicalNeeded":true,"numberOfPeople":3,"status":"REPORTED","timestamp":1593030919205,"victimName":"John Doe","victimPhoneNumber":"111-111-111"},"id":"ef4cdaf8-c1b6-4a5b-97e4-6169c7429474","invokingService":"IncidentService","messageType":"IncidentReportedEvent","timestamp":1593030919520}
+----
+
+== Implement Outbox pattern in the Incident Service of the Emergency Response Application
+
+You are ready now to start implementing the outbox pattern in the incident service of the Emergency Response application. In a nutshell, the changes required to the codebase include:
+
+* Create an Entity bean for the outbox event
+* Create a repository service for the outbox event
+* Remove the code responsible for producing messages to Kafka and replace with the repository service code
+* Modify unit tests to reflect the new architecture
+
+{nbsp}
+
+. Check out the code for the incident service:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/incident-service.git
+$ cd incident-service
+----
+. Import the code into your IDE of choice.
+. Ensure the code builds correctly and the unit tests are succeeding:
++
+----
+$ mvn clean package
+----
+. Familiarize yourself with the code. The incident service is implemented using Quarkus, and follows a layered approach. Some classes of interest include:
+* `IncidentsResource`: REST API layer, implemented using JAX-RS. Note that this layer communicates with the other parts of the application using the Quarkus Vert.x EventBus (https://quarkus.io/guides/reactive-messaging).
+* `IncidentRepository` and `Incident`: persistence layer, implemented using JPA. 
+* `EventBusConsumer`: consumes EventBus messages and dispatches them to the service layer.
+* `IncidentService`: service layer.
+* `IncidentCommandMessageSource`: message consumer for _UpdateIncidentCommand_ messages. Uses Quarkus reactive messaging.
+* `EventBusConsumer` and `IncidentCommandMessageSource` contain code to produce outgoing Kafka messages, using Quarkus reactive messaging.
+
+. Start by creating an Entity bean for the Outbox event in the `com.redhat.emergency.response.incident.entity` package. 
++
+----
+@Entity
+@Table(name = "incident_outbox")
+public class OutboxEvent {
+
+    @Id
+    @GeneratedValue
+    private UUID id;
+
+    @Column(name = "aggregatetype")
+    @NotNull
+    private String aggregateType;
+
+    @Column(name = "aggregateid")
+    @NotNull
+    private String aggregateId;
+
+    @NotNull
+    private String type;
+
+    @Lob
+    @Type(type = "org.hibernate.type.TextType")
+    @NotNull
+    private String payload;
+
+    OutboxEvent() {
+    }
+
+    public OutboxEvent(String aggregateType, String aggregateId, String type, String payload) {
+        this.aggregateType = aggregateType;
+        this.aggregateId = aggregateId;
+        this.type = type;
+        this.payload = payload;
+    }
+----
++
+* The table and column names match the default table and column names as expected by the Debezium outbox event router (see below).
+* Notice the payload field, which is annotated as a `Lob` field of type `Text`. 
+* Add getters and setters.
+
+. Create a class in the `com.redhat.emergency.response.incident.repository` package to persist the Outbox entities. The entity can be deleted as part of the same transaction. Debezium will detect both changes - the insert and the delete - but will ignore the delete event.
++
+----
+@ApplicationScoped
+public class OutboxEmitter {
+
+    @Inject
+    EntityManager entityManager;
+
+    public void emitEvent(OutboxEvent event) {
+        entityManager.persist(event);
+        entityManager.remove(event);
+    }
+
+}
+----
+
+. The incident service publishes an _IncidentReportedEvent_ message to the `topic-incident-event` topic whenever a new Incident entity is created. When applying the outbox pattern, the message is persisted in the database. The code to handle this can be added to the `create` method of the `IncidentService` class. Inject the `OutboxEmitter` in the `IncidentService` and modify the `create` method:
++
+----
+    @Inject
+    OutboxEmitter outboxEmitter;
+
+    @Transactional
+    public JsonObject create(JsonObject incident) {
+        Incident created = repository.create(toEntity(incident));
+
+        Message<IncidentEvent> message = new Message.Builder<>("IncidentReportedEvent", "IncidentService",
+                new IncidentEvent.Builder(created.getIncidentId())
+                        .lat(new BigDecimal(created.getLatitude()))
+                        .lon(new BigDecimal(created.getLongitude()))
+                        .medicalNeeded(created.isMedicalNeeded())
+                        .numberOfPeople(created.getNumberOfPeople())
+                        .timestamp(created.getTimestamp())
+                        .victimName(created.getVictimName())
+                        .victimPhoneNumber(created.getVictimPhoneNumber())
+                        .status(created.getStatus())
+                        .build())
+                .build();
+
+        String messageStr = Json.encode(message);
+        OutboxEvent outboxEvent = new OutboxEvent("incident-event", created.getIncidentId(), message.getMessageType(), messageStr);
+        outboxEmitter.emitEvent(outboxEvent);
+
+        return fromEntity(created);
+    }
+----
++
+* The aggregate type is set to `incident-event`. The value is used by the Debezium outbox event router to route the message to the correct Kafka topic.
+* The aggregate ID is used as the key for the Kafka message. In this case the incident ID is used as the key.
+
+. Add tests for the new code in the `IncidentServiceTest` test class. In the test, mock out the OutboxEmitter, and verify in the `testCreate` method that the `emitEvent` method is called with the expected method parameter.
++
+----
+@QuarkusTest
+public class IncidentServiceTest {
+
+[...]
+    @InjectMock
+    OutboxEmitter outboxEmitter;
+
+    @Captor
+    ArgumentCaptor<OutboxEvent> outboxEventCaptor;
+
+[...]
+
+    @Test
+    void testCreate() {
+        [...]
+        verify(outboxEmitter).emitEvent(outboxEventCaptor.capture());
+        OutboxEvent outboxEvent = outboxEventCaptor.getValue();
+        assertThat(outboxEvent, notNullValue());
+        // assert contents of outbox event        
+    }
+[...]
+}   
+----
+
+. The incident service publishes an _IncidentUpdatedEvent_ message to the `topic-incident-event` topic whenever an Incident entity is updated. When applying the outbox pattern, the message is persisted in the outbox table. The code to handle this can be added to the `updateIncident` method of the `IncidentService` class.
++
+----
+    @Transactional
+    public JsonObject updateIncident(JsonObject incident) {
+        Incident current = repository.findByIncidentId(incident.getString("id"));
+        [...]
+        Message<IncidentEvent> message = new Message.Builder<>("IncidentUpdatedEvent", "IncidentService",
+                new IncidentEvent.Builder(current.getIncidentId())
+                        .lat(new BigDecimal(current.getLatitude()))
+                        .lon(new BigDecimal(current.getLongitude()))
+                        .medicalNeeded(current.isMedicalNeeded())
+                        .numberOfPeople(current.getNumberOfPeople())
+                        .timestamp(current.getTimestamp())
+                        .victimName(current.getVictimName())
+                        .victimPhoneNumber(current.getVictimPhoneNumber())
+                        .status(current.getStatus())
+                        .build())
+                .build();
+        String messageStr = Json.encode(message);
+        OutboxEvent outboxEvent = new OutboxEvent("incident-event", current.getIncidentId(), message.getMessageType(), messageStr);
+        outboxEmitter.emitEvent(outboxEvent);
+
+        return fromEntity(current);
+    }
+----
+
+. Add tests for the new code in the `IncidentServiceTest` test class. This is very similar to what you did with the `testCreate` method.
+
+. The code which is responsible for sending _IncidentReportedEvent_ and _IncidentUpdatedEvent_ Kafka messages is no longer needed, and can be removed. This code is in the `EventBusConsumer` and `IncidentCommandMessageSource` classes. +
+Comment or remove the following code fragments:
++
+----
+@ApplicationScoped
+public class EventBusConsumer {
+
+    [...]
+    //no longer needed
+    //private final UnicastProcessor<JsonObject> processor = UnicastProcessor.create();
+
+    [...]
+
+    private void createIncident(Message<JsonObject> msg) {
+        JsonObject created = service.create(msg.body());
+    //    processor.onNext(created); // no longer needed
+        msg.replyAndForget(new JsonObject());
+    }
+
+    // no longer needed
+    //@Outgoing("incident-event")
+    //public Multi<org.eclipse.microprofile.reactive.messaging.Message<String>> source() {
+    //    return processor.onItem().apply(this::toMessage);
+    //}
+
+    // no longer needed
+    //private org.eclipse.microprofile.reactive.messaging.Message<String> toMessage(JsonObject incident) {
+    //    com.redhat.emergency.response.incident.message.Message<IncidentEvent> message
+    //            = new com.redhat.emergency.response.incident.message.Message.Builder<>("IncidentReportedEvent", "IncidentService",
+    //                new IncidentEvent.Builder(incident.getString("id"))
+    //                    .lat(new BigDecimal(incident.getString("lat")))
+    //                    .lon(new BigDecimal(incident.getString("lon")))
+    //                    .medicalNeeded(incident.getBoolean("medicalNeeded"))
+    //                    .numberOfPeople(incident.getInteger("numberOfPeople"))
+    //                   .timestamp(incident.getLong("timestamp"))
+    //                    .victimName(incident.getString("victimName"))
+    //                    .victimPhoneNumber(incident.getString("victimPhoneNumber"))
+    //                    .status(incident.getString("status"))
+    //                    .build())
+    //            .build();
+    //    Jsonb jsonb = JsonbBuilder.create();
+    //    String json = jsonb.toJson(message);
+    //    log.debug("Message: " + json);
+    //    return KafkaRecord.of(incident.getString("id"), json);
+
+    //}
+----
++
+Do the same for the `IncidentCommandMessageSource` class.
+
+. Fix the test code in the `EventConsumerTest` and `IncidentCommandMessageSourceTest` test classes.
+
+. Finally, remove the Quarkus reactive configuration properties for the outgoing reactive messaging channels in the `src/main/resources/application.properties` and `src/test/resources/application.properties` configuration files. +
+Remove the following properties
++
+----
+# Configure the Kafka sink
+mp.messaging.outgoing.incident-event.connector=smallrye-kafka
+mp.messaging.outgoing.incident-event.key.serializer=org.apache.kafka.common.serialization.StringSerializer
+mp.messaging.outgoing.incident-event.value.serializer=org.apache.kafka.common.serialization.StringSerializer
+mp.messaging.outgoing.incident-event.acks=1
+
+mp.messaging.outgoing.incident-event-1.connector=smallrye-kafka
+mp.messaging.outgoing.incident-event-1.key.serializer=org.apache.kafka.common.serialization.StringSerializer
+mp.messaging.outgoing.incident-event-1.value.serializer=org.apache.kafka.common.serialization.StringSerializer
+mp.messaging.outgoing.incident-event-1.acks=1
+----
++
+----
+mp.messaging.outgoing.incident-event.connector=smallrye-in-memory
+
+mp.messaging.outgoing.incident-event-1.connector=smallrye-in-memory
+----
+
+. Ensure the incident service builds successfully and passes all the tests.
+
+[NOTE]
+====
+The _outbox_ branch of the incident service code repository contains the completed outbox implementation.
+====
+
+== Deploy the Incident Service with Outbox pattern
+
+. Create the outbox table in the PostgreSQL database. Obtain a shell into the PostgreSQL pod and execute the following commands:
++
+----
+$ oc project user1-outbox-test
+$ oc rsh <name of the postgresql pod>
+sh-4.2$ psql
+postgres-# \c emergency_response_demo
+You are now connected to database "emergency_response_demo" as user "postgres".
+emergency_response_demo=# CREATE TABLE public.incident_outbox (id uuid NOT NULL, aggregatetype character varying(255) NOT NULL, aggregateid character varying(255) NOT NULL,type character varying(255) NOT NULL, payload text);
+CREATE TABLE
+emergency_response_demo=# ALTER TABLE public.incident_outbox OWNER TO naps;
+ALTER TABLE
+emergency_response_demo=# ALTER TABLE ONLY public.incident_outbox ADD CONSTRAINT incident_outbox_pkey PRIMARY KEY (id);
+ALTER TABLE
+emergency_response_demo=# \q
+sh-4.4$ exit
+exit
+----
++
+The names of the table columns correspond to the default names expected by the Debezium outbox event router.
++
+* id: primary key, represents the unique ID of the event. The id is sent as a header in the Kafka message, and can be used on the consumer side for message de-duplication for example.
+* aggregatetype: the default field for the routing, gets appended to the topic name to which the event is routed.
+* aggregateid: becomes the Kafka message key.
+* payload: The JSON representation of the event itself, becomes the payload of the Kafka message.
+* type: the type of the event. Not essential for routing, but can be added to the event message as a message header for example.
+
+. Deploy the Kafka Debezium connector. AMQ Streams defines an OpenShift Custom Resource Definition (CRD) for Kafka Connect connectors. The deployment of a KafkaConnect Custom Resource is detected by the AMQ Streams operator, which will apply the connector configuration. Note that the library containing the connector code must be present on the Kafka Connect instance. +
+You can find the PostgreSQL admin password in the `postgresql-credentials` secret.
++
+----
+$ POSTGRESQL_ADMIN_PASSWD="$(oc get secret postgresql-credentials --no-headers -o custom-columns=:data.database-admin-password -n user1-outbox-test | base64 -d)"
+$ echo "---
+apiVersion: kafka.strimzi.io/v1alpha1
+kind: KafkaConnector
+metadata:
+  name: incident-service-outbox
+  labels:
+    strimzi.io/cluster: kafka-connect
+spec:
+  class: 'io.debezium.connector.postgresql.PostgresConnector'
+  tasksMax: 1
+  config:
+    plugin.name: decoderbufs
+    database.hostname: postgresql
+    database.port: '5432'
+    database.user: postgres
+    database.password: ${POSTGRESQL_ADMIN_PASSWD}
+    database.dbname: emergency_response_demo
+    database.server.name: erdemo
+    schema.whitelist: public
+    table.whitelist: public.incident_outbox
+    tombstones.on.delete : 'false'
+    transforms: router
+    transforms.router.type: io.debezium.transforms.outbox.EventRouter
+    transforms.router.table.fields.additional.placement: 'type:header:eventType'
+    transforms.router.route.topic.replacement: topic-\${routedByValue}
+" | tee /tmp/debezium-connector.yml
+$ oc create -f /tmp/debezium-connector.yml -n user1-outbox-test
+----
++
+* class: the name of the Debezium PostgreSQL connector class.
+* taskMax: the maximum number of tasks that should be created for this connector. The Debezium PostgreSQL connector always uses a single task and therefore ignores this value.
+* plugin.name: the decoder used by the Debezium connector.
+* database.hostname: the hostname of the PostgreSQL server.
+* database.port: the port of the PostgreSQL server.
+* database.user: the name of the PostgreSQL user.
+* database.password: the password of the PostgreSQL user.
+* database.dbname: the name of the PostgreSQL database to connect to.
+* database.server.name: the logical name of the PostgreSQL server. Used as a namespace by Debezium and is used in the names of the Kafka topics to which the connector writes, and the Kafka Connect schema names.
+* schema.whitelist: a list of all schemas hosted by the PostgreSQL server that the connector will monitor.
+* table.whitelist:  a list of all tables hosted by the PostgreSQL server that the connector will monitor.
+* tombstones.on.delete : by setting the value to false, no deletion markers ("tombstones") will be emitted by the connector when an event record gets deleted from the outbox table. 
+* transforms: Kafka Connect Single Message Transform used by the Debezium Connector.
+* transforms.router.type: the name of the class implementing the SMT.
+* transforms.router.table.fields.additional.placement: configuration setting of the Debezium router which allows to add additional information to the produced Kafka messages; `type:header:eventType` means that the contents of the `eventType` field will be added as a header to the Kafka message.
+* transforms.router.route.topic.replacement: the name of the topic to which the events will be routed, a replacement ${routedByValue} is available which is the value of the column configured via `route.by.field` (which defaults to the `aggregatetype` column in the outbox table).
+
+. Check the Kafka Connect logs. Look for the log statements indicating that the connector started successfully:
++
+----
+2020-06-26 14:17:02,271 INFO Starting PostgresConnectorTask with configuration: (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    connector.class = io.debezium.connector.postgresql.PostgresConnector (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    database.dbname = emergency_response_demo (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    database.user = postgres (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    transforms.router.table.fields.additional.placement = type:header:eventType (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    transforms.router.type = io.debezium.transforms.outbox.EventRouter (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    tasks.max = 1 (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    transforms = router (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    database.server.name = erdemo (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    transforms.router.route.topic.replacement = topic-${routedByValue} (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    database.port = 5432 (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    plugin.name = pgoutput (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    schema.whitelist = public (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    table.whitelist = public.incident_outbox (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    tombstones.on.delete = false (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,272 INFO    task.class = io.debezium.connector.postgresql.PostgresConnectorTask (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,273 INFO    database.hostname = postgresql (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,273 INFO    database.password = ******** (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,273 INFO    name = incident-service-outbox (io.debezium.connector.common.BaseSourceTask) [task-thread-incident-service-outbox-0]
+2020-06-26 14:17:02,364 INFO [Producer clientId=connector-producer-incident-service-outbox-0] Cluster ID: V8CoUdFKTnK9x54gDQ0LKg (org.apache.kafka.clients.Metadata) [kafka-producer-network-thread | connector-producer-incident-service-outbox-0]
+2020-06-26 14:17:02,916 INFO user 'postgres' connected to database 'emergency_response_demo' on PostgreSQL 10.10 on x86_64-redhat-linux-gnu, compiled by gcc (GCC) 8.3.1 20190223 (Red Hat 8.3.1-2), 64-bit with roles:
+	role 'pg_read_all_settings' [superuser: false, replication: false, inherit: true, create role: false, create db: false, can log in: false]
+	role 'pg_stat_scan_tables' [superuser: false, replication: false, inherit: true, create role: false, create db: false, can log in: false]
+	role 'naps' [superuser: false, replication: false, inherit: true, create role: false, create db: false, can log in: true]
+	role 'pg_monitor' [superuser: false, replication: false, inherit: true, create role: false, create db: false, can log in: false]
+	role 'pg_read_all_stats' [superuser: false, replication: false, inherit: true, create role: false, create db: false, can log in: false]
+	role 'pg_signal_backend' [superuser: false, replication: false, inherit: true, create role: false, create db: false, can log in: false]
+	role 'postgres' [superuser: true, replication: true, inherit: true, create role: true, create db: true, can log in: true] (io.debezium.connector.postgresql.PostgresConnectorTask) [task-thread-incident-service-outbox-0]
+----
+
+. Delete the outgoing channel configuration from the `incident-service` configmap. +
+Delete the following configuration:
++
+----
+mp.messaging.outgoing.incident-event.topic=topic-incident-event
+mp.messaging.outgoing.incident-event-1.topic=topic-incident-event
+----
+
+. Build and deploy the incident service image with the outbox implementation. The commands hereunder use rootless _podman_ to build the image locally and push it to the registry on OpenShift. Refer to the first lab of the course for alternative ways to deploy to OpenShift.
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-outbox-test/incident-service:outbox .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-outbox-test/incident-service:outbox
+----
+
+. Patch the incident service deploymentconfig to point to the new image. This will force a redeployment of the incident service application. 
++
+----
+$ oc patch dc incident-service --type='json' -p '[{"op": "replace", "path": "/spec/triggers/1/imageChangeParams/from/name", "value": "incident-service:outbox"}]' -n user1-outbox-test
+----
+
+== Test the Incident Service with Outbox Pattern
+
+. Create an incident with the _curl_ utility.
++
+----
+$ echo '
+{
+  "lat": 34.98125,
+  "lon": -77.84121,
+  "numberOfPeople": 5,
+  "medicalNeeded": true,
+  "victimName": "Jane Foo",
+  "victimPhoneNumber": "(458) 741-45823)"
+}
+' | tee /tmp/incident.json
+$ INCIDENT_SERVICE_URL=$(oc get route incident-service -n user1-outbox-test --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/incident.json http://${INCIDENT_SERVICE_URL}/incidents
+----
+
+. Check the logs of the kafka consumer app. Look for the output of the _IncidentReportedEvent_ message:
++
+----
+2020-06-26 15:50:48,956 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-16) Consumed message from topic 'topic-incident-event', partition '10', offset '0'
+2020-06-26 15:50:48,956 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-16)     Message key: "829fce70-83ae-49dd-b0dc-6dfbdfd7dc43"
+2020-06-26 15:50:48,956 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-16)     Message value: "{\"body\":{\"id\":\"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43\",\"lat\":34.98125,\"lon\":-77.84121,\"medicalNeeded\":true,\"numberOfPeople\":5,\"status\":\"REPORTED\",\"timestamp\":1593186647482,\"victimName\":\"Jane Foo\",\"victimPhoneNumber\":\"(458) 741-45823)\"},\"id\":\"84b29d53-93ee-492f-8afa-8998b8af1250\",\"invokingService\":\"IncidentService\",\"messageType\":\"IncidentReportedEvent\",\"timestamp\":1593186647985}"
+----
++
+NOTE: Notice that the message payload is enclosed in quotes, and the quotes inside the JSON message are escaped. This is expected and a result of how Debezium handles the payload column contents in the outbox table. +
+This means that on the consumer side, the message will have to be un-escaped as part of message deserialization, or in the consumer application code itself when processing the message.
+
+. Check the logs of the kafka connect pod. When using default log levels the Debezium connector does not produce much output. However you should be able to find a log statement indicating that a delete message is ignored. The delete message is picked up as a result of deleting the outbox entity in the database. The Debezium connector is configured to ignore deletes.
++
+----
+2020-06-26 15:50:48,946 INFO Delete message Struct{id=1eeb9f9d-8a41-4657-8887-9a046c408108} ignored (io.debezium.transforms.outbox.EventRouter) [task-thread-incident-service-outbox-0]
+----
+
+. Test updating an incident. An incident is updated by sending an _IncidentUpdateCommand_ message to the `topic-incident-command` Kafka topic. The incident service consumes the message an updates the state of the incident entity in the database according to the message payload. After the update, an _IncidentUpdatedEvent_ message is sent to the `topic-incident-event` topic with the new state of the incident. +
+To produce a Kafka message in the `topic-incident-command`, you can post a JSON payload with the message key and value to the kafka producer app. + 
+Make sure that the key and the incident id in the body corresponds to the id of the incident created in the previous step. 
++
+----
+$ echo '
+{
+  "key":"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43",
+  "value":{
+    "messageType" : "UpdateIncidentCommand",
+    "id":"messageId",
+    "invokingService":"test",
+    "timestamp":1521148332397,
+    "body": {
+      "incident": {
+        "id": "829fce70-83ae-49dd-b0dc-6dfbdfd7dc43",
+        "status": "ASSIGNED"
+      }
+    }
+  }  
+}
+' | tee /tmp/update-incident.json
+$ KAFKA_PRODUCER_APP=http://$(oc get route kafka-producer-app -n user1-outbox-test --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/update-incident.json ${KAFKA_PRODUCER_APP}/produce
+----
+
+. Check the logs of the kafka consumer app. Look for the contents of the _IncidentUpdatedEvent_ message.
++
+----
+2020-06-26 16:13:15,444 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-17) Consumed message from topic 'topic-incident-event', partition '10', offset '1'
+2020-06-26 16:13:15,444 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-17)     Message key: "829fce70-83ae-49dd-b0dc-6dfbdfd7dc43"
+2020-06-26 16:13:15,444 INFO  [org.acm.qua.kaf.KafkaRecordConsumer] (Thread-17)     Message value: "{\"body\":{\"id\":\"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43\",\"lat\":34.98125,\"lon\":-77.84121,\"medicalNeeded\":true,\"numberOfPeople\":5,\"status\":\"ASSIGNED\",\"timestamp\":1593186647482,\"victimName\":\"Jane Foo\",\"victimPhoneNumber\":\"(458) 741-45823)\"},\"id\":\"45b8dd1e-b34f-4e4d-a0f9-4770a57e096a\",\"invokingService\":\"IncidentService\",\"messageType\":\"IncidentUpdatedEvent\",\"timestamp\":1593187995148}"
+----
+
+== Optional: update Emergency Response Demo
+
+The incident service implementation with outbox is now ready to be integrated in the Emergency Demo application. How exactly to do this is left as an optional exercise. From a high-level point of view, this would require the following changes:
+
+* Ensure that the incident service uses PostgreSQL version 10 or later. The Debezium connector can use the _pgoutput_ decoding module, so there is no need to have additional decoder plug-ins installed on the PostgreSQL image.
+* Add the outbox table creation script to the initialization scripts for the PostgreSQL database.
+* Deploy Kafka Connect. Ensure that the Debezium connector plug-in for PostgreSQL is installed on the Kafka Connect image.
+* Deploy the Debezium Kafka connector on Kafka connect.
+* The payload of the Kafka messages produced by the Debezium connector is quoted, and if the payload contains double quotes, these are escaped. On the other hand, the payload of Kafka messages produced by the incident service (without outbox) are not quoted, and double quotes are not escaped. This difference must be handled at the consumer side. This can be done in the consumer code of each service, but probably a more elegant solution is to handle this when the message is deserialized in the Kafka client. Most services in the Emergency Response demo use the Kafka `StringDeserializer` to transform the Kafka message payload into a String. When using outbox, you can use a custom String deserializer which knows how to handle quoted message payload. +
+As an example, the implementation of this deserializer could use the Apache Commons Text library to unescape the JSON message payload:
++
+----
+public class QuotedStringDeserializer implements Deserializer<String> {
+
+    private String encoding = "UTF8";
+
+    @Override
+    public void configure(Map<String, ?> configs, boolean isKey) {
+        String propertyName = isKey ? "key.deserializer.encoding" : "value.deserializer.encoding";
+        Object encodingValue = configs.get(propertyName);
+        if (encodingValue == null)
+            encodingValue = configs.get("deserializer.encoding");
+        if (encodingValue instanceof String)
+            encoding = (String) encodingValue;
+    }
+
+    @Override
+    public String deserialize(String topic, byte[] data) {
+        try {
+            if (data == null) {
+                return null;
+            }
+            else {
+                String deserialized = new String(data, encoding);
+                if (deserialized.startsWith("\"")) {
+                    String unescaped = StringEscapeUtils.unescapeJson(deserialized);
+                    return unescaped.substring(1, unescaped.length()-1);
+                }
+                return deserialized;
+            }
+        } catch (UnsupportedEncodingException e) {
+            throw new SerializationException("Error when deserializing byte[] to string due to unsupported encoding " + encoding);
+        }
+    }
+
+    @Override
+    public void close() {
+        // nothing to do
+    }
+}
+----
+
+== Tear down the test environment
+
+In order to free up resources on the OpenShift cluster, you can tear down the environment you deployed in the first step of the lab. +
+To do so, execute the following Ansible commands:
+
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_producer_app.yml -e project_admin=user1 -e project_name=outbox-test -e ACTION=uninstall 
+$ ansible-playbook -i inventories/inventory playbooks/kafka_consumer_app.yml -e project_admin=user1 -e project_name=outbox-test -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/incident_service.yml -e project_admin=user1 -e project_name=outbox-test -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/postgresql.yml -e project_admin=user1 -e project_name=outbox-test -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_connect.yml -e project_admin=user1 -e project_name=outbox-test -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=outbox-test -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=outbox-test -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=outbox-test -e ACTION=uninstall
+----

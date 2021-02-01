@@ -1,0 +1,58 @@
+- hosts: localhost
+  connection: local
+  vars_prompt:
+    - name: username
+      prompt: What is your Quay's username?
+      private: no
+    - name: password
+      prompt: What is your Quay's password?
+    - name: organization
+      prompt: organization/user in Quay?
+      private: no
+  vars:
+    app_path: "../../frontend/web_app"
+    image_registry_path: "quay.io/{{ organization }}/containers-lab-frontend:latest"
+    container_name: "frontend"    
+  tasks:
+  - debug:
+      msg: 'Username: {{ username }}'
+
+  - name: Get infos on container
+    community.docker.docker_container_info:
+      name: "{{ container_name }}"
+    register: result
+
+  - name: Does container exist?
+    ansible.builtin.debug:
+      msg: "The container {{ 'exists' if result.exists else 'does not exist' }}"
+
+  - name: Stop the container if exists before creation
+    community.general.docker_container:
+      name: "{{ container_name }}"
+      state: absent
+      force_kill: yes
+    when: "{{ result.exists }}"
+
+  - name: Remove image
+    command: docker image rm "{{ image_registry_path }}"
+    register: remove
+    failed_when: remove.rc == "No such" not in remove.stdout
+  - debug: msg="{{ remove.stdout }}"
+
+  - name: Build the frontend image
+    community.general.docker_image:
+      build: 
+        path: "{{ app_path }}"
+      name: "{{ image_registry_path }}"
+      push: yes
+      source: build
+  
+  - name: Create the frontend container
+    community.general.docker_container:
+      name: "{{ container_name }}"
+      image: "{{ image_registry_path }}"
+      pull: yes
+      ports:
+       - "80:80"
+
+       

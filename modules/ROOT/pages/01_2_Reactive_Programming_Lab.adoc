@@ -1,0 +1,797 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== Reactive Programming lab
+
+.Prerequisites
+* Access to the Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6.x
+
+:numbered:
+
+== Introduction
+
+In this lab you will compare and deploy two versions of the same service. One version is written with Spring Boot using a traditional blocking threading model: every REST request is assigned a thread from the web server thread pool, and holds this thread during the duration of the request. When the request is completed, the thread is returned to the pool and can be used for a new request.
+
+The second version of the service is implemented with Quarkus, which uses the non-blocking and reactive Vert.x engine under the hood, and _Mutiny_, which is a reactive programming library allowing to express and compose asynchronous actions. In a non-blocking application requests are processed asynchronously, so the same thread can serve multiple concurrent requests. Asynchronous processing results in better scalability and concurrency compared to blocking applications.
+
+== Reactive vs Blocking Programming Styles
+
+=== Incident Finder Service - Spring Boot Version
+
+In this section of the lab you deploy the Spring Boot version incident finder service and verify its functionality.
+
+. In order to test the incident finder services, you need some incident and mission data. If you have not done so yet, open a browser window, navigate to the Emergency Response console, log in as _incident_commander_, and run a simulation.
+
+. Check out the code for the incident finder service:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/incident-finder-service-sb.git
+$ cd incident-finder-service-sb
+----
+. Import the code into your IDE of choice
+. Ensure the code builds correctly
++
+----
+$ mvn clean package
+----
+. Familiarize yourself with the code. This is a fairly straightforward Spring Boot application, which exposes a REST endpoint and calls out to a number of upstream services over REST. The outgoing REST calls use Spring's RestTemplate. +
+From a functional point of view, the service obtains a list of incidents matching a given name, and for each of these incidents, calls the mission service and the disaster service to get details about the mission and shelter attached to the incident. The consolidated data is sent back to the caller.
+
+. Create a new project on OpenShift.
++
+----
+$ oc new-project user1-reactive
+----
+
+. Build the application, create an image and push to OpenShift:
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-reactive/incident-finder-service-sb:latest .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-reactive/incident-finder-service-sb:latest
+----
++
+This creates an ImageStream in the `user1-reactive` project pointing to the image.
+
+. Create a configmap for the external configuration of the incident finder service. The configuration settings assume that you deployed the Emergency Response application in the `user1-er-demo` namespace. If your namespace is different you have to adjust the configuration settings.
++
+----
+$ echo '
+mission.service.scheme=http
+mission.service.url=mission-service.user1-er-demo.svc:8080
+mission.service.path=/api/missions/incident/{id}
+
+incident.service.scheme=http
+incident.service.url=incident-service.user1-er-demo.svc:8080
+incident.service.path=/incidents/byname/{name}
+
+disaster.service.scheme=http
+disaster.service.url=disaster-service.user1-er-demo.svc:8080
+disaster.service.path=/shelters
+
+server.tomcat.max-threads=15
+' | tee /tmp/incident-finder-service-sb-application.properties
+$ oc create configmap incident-finder-service-sb -n user1-reactive --from-file=application.properties=/tmp/incident-finder-service-sb-application.properties
+----
++
+Notice that we limit the number of threads allocated to the embedded Tomcat server to 15. This is an artificially low number - if not set explicitly the default is 200 threads, but this allows to easily demonstrate the difference between the blocking and non blocking versions.
+
+. Create a deploymentconfig for the incident finder application:
++
+----
+$ echo '
+kind: DeploymentConfig
+apiVersion: apps.openshift.io/v1
+metadata:
+  name: incident-finder-service-sb
+  labels:
+    app: incident-finder-service-sb
+spec:
+  strategy:
+    type: Rolling
+    rollingParams:
+      updatePeriodSeconds: 1
+      intervalSeconds: 1
+      timeoutSeconds: 3600
+      maxUnavailable: 25%
+      maxSurge: 25%
+    resources: {}
+    activeDeadlineSeconds: 21600
+  triggers:
+    - type: ConfigChange
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        containerNames:
+          - incident-finder-service-sb
+        from:
+          kind: ImageStreamTag
+          name: incident-finder-service-sb:latest
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    app: incident-finder-service-sb
+    group: erd-services
+  template:
+    metadata:
+      labels:
+        app: incident-finder-service-sb
+        group: erd-services
+    spec:
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+        - resources:
+            limits:
+              cpu: 250m
+              memory: 250Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 3
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          terminationMessagePath: /dev/termination-log
+          name: incident-finder-service-sb
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          env:
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+          securityContext:
+            privileged: false
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: config
+              mountPath: /deployments/config
+          terminationMessagePolicy: File
+      volumes:
+        - name: config
+          configMap:
+            name: incident-finder-service-sb
+            defaultMode: 420
+      dnsPolicy: ClusterFirst
+' | oc create -f - -n user1-reactive
+----
+
+. Expose the incident finder service through a service and a route.
++
+----
+$ oc expose dc incident-finder-service-sb --port=8080 -n user1-reactive
+$ oc expose service incident-finder-service-sb -n user1-reactive
+----
+
+. Obtain the URL to the incident finder service:
++
+----
+$ INCIDENT_FINDER_SERVICE_SB_URL=http://$(oc get route incident-finder-service-sb -n user1-reactive --template='{{ .spec.host }}')
+----
+
+. Test the incident finder service with `curl`. Expect a HTTP `200 OK` return code:
++
+----
+$ curl -v $INCIDENT_FINDER_SERVICE_SB_URL/incidents?name=jones
+----
++
+.Sample Output
+----
+*   Trying 18.194.125.175:80...
+* Connected to incident-finder-service-sb-user1-reactive.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 80 (#0)
+> GET /incidents?name=jones HTTP/1.1
+> Host: incident-finder-service-sb-user1-reactive.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 
+< content-type: application/json;charset=UTF-8
+< transfer-encoding: chunked
+< date: Fri, 07 Aug 2020 13:41:57 GMT
+< set-cookie: ef383b94b8dbe9c2cd68229d2e5947d9=a0dff69b7871c1c3d145e1dcbb3c6796; path=/; HttpOnly
+< cache-control: private
+< 
+* Connection #0 to host incident-finder-service-sb-user1-reactive.apps.cluster-03b3.03b3.example.opentlc.com left intact
+[{"id":"43e24efe-aab2-41c3-966d-6fc24f5fdb34","lat":"34.17552","lon":"-77.87287","numberOfPeople":3,"medicalNeeded":true,"victimName":"Theodore Jones","victimPhoneNumber":"(336) 555-8016","timestamp":1596483630894,"status":"RESCUED","destinationLat":34.1706,"destinationLon":-77.949,"destinationName":"Wilmington Marine Center","currentPositionLat":34.1707,"currentPositionLon":-77.9484}]
+----
++
+[NOTE]
+====
+If the curl command returns an empty array, try again with another name. You can check the existing incidents with a call to the incident service:
+
+----
+$ oc expose service incident-service -n user1-er-demo
+$ INCIDENT_SERVICE_URL=http://$(oc get route incident-service -n user1-er-demo --template='{{ .spec.host }}')
+$ curl $INCIDENT_SERVICE_URL/incidents 
+----
+
+Choose a name of one of the existing incidents.
+====
+
+=== Incident Finder Service - Quarkus Reactive Version
+
+In this section of the lab you deploy the Quarkus version of the incident finder service and verify its functionality.
+
+. Check out the code for the Quarkus version of the incident finder service:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/incident-finder-service-reactive.git
+$ cd incident-finder-service-reactive
+----
+. Import the code into your IDE of choice
+. Ensure the code build correctly
++
+----
+$ mvn clean package
+----
+. Familiarize yourself with the code. 
+From a functional point, the service does exactly the same as the Spring Boot version. But the programming paradigm is completely different. The application uses reactive and asynchronous programming techniques and frameworks. +
+Some things to note:
+* `IncidentResource`: Exposes the REST endpoint of the service. Uses Quarkus Reactive routes (https://quarkus.io/guides/reactive-routes), which are built on top of the vert.x engine that powers Quarkus. +
+The `doGetIncidents` method implements the orchestration of the calls to the incident service, the mission service and the disaster service as a reactive pipeline using the _Mutiny_ reactive library (https://smallrye.io/smallrye-mutiny).
+* `IncidentService`, `MissionService`, `ShelterService`: implement the calls to the upstream services. They use the non-blocking, asynchronous Vert.x web client library.
+
+. Build the application, create an image and push to OpenShift:
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-reactive/incident-finder-service-reactive:latest .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-reactive/incident-finder-service-reactive:latest
+----
++
+This creates an ImageStream in the `user1-reactive` project pointing to the image.
+
+. Create a configmap for the external configuration of the incident finder service. The configuration settings assume that you deployed the Emergency Response application in the `user1-er-demo` namespace. If your namespace is different you have to adjust the configuration settings.
++
+----
+$ echo '
+incident-service.url=incident-service.user1-er-demo.svc
+mission-service.url=mission-service.user1-er-demo.svc
+disaster-service.url=disaster-service.user1-er-demo.svc
+quarkus.vertx.event-loops-pool-size=5
+' | tee /tmp/incident-finder-service-reactive-application.properties
+$ oc create configmap incident-finder-service-reactive -n user1-reactive --from-file=application.properties=/tmp/incident-finder-service-reactive-application.properties
+----
++
+Notice that we set the number of Vert.x event loop threads to 5. By default the number of event loop threads is calculated based on the numbers of CPU cores available to the Java JVM and is set to twice that number. Considering that we only allocate a fraction of a CPU to the incident finder application on OpenShift, the default would be 1 event-loop thread, which is sub-optimal. 
+
+. Create a deploymentconfig for the incident finder application:
++
+----
+$ echo '
+kind: DeploymentConfig
+apiVersion: apps.openshift.io/v1
+metadata:
+  name: incident-finder-service-reactive
+  labels:
+    app: incident-finder-service-reactive
+spec:
+  strategy:
+    type: Rolling
+    rollingParams:
+      updatePeriodSeconds: 1
+      intervalSeconds: 1
+      timeoutSeconds: 3600
+      maxUnavailable: 25%
+      maxSurge: 25%
+    resources: {}
+    activeDeadlineSeconds: 21600
+  triggers:
+    - type: ConfigChange
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        containerNames:
+          - incident-finder-service-reactive
+        from:
+          kind: ImageStreamTag
+          name: incident-finder-service-reactive:latest
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    app: incident-finder-service-reactive
+    group: erd-services
+  template:
+    metadata:
+      labels:
+        app: incident-finder-service-reactive
+        group: erd-services
+    spec:
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+        - resources:
+            limits:
+              cpu: 250m
+              memory: 250Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 3
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          terminationMessagePath: /dev/termination-log
+          name: incident-finder-service-reactive
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          env:
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+          securityContext:
+            privileged: false
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: config
+              mountPath: /deployments/config
+          terminationMessagePolicy: File
+      volumes:
+        - name: config
+          configMap:
+            name: incident-finder-service-reactive
+            defaultMode: 420
+      dnsPolicy: ClusterFirst
+' | oc create -f - -n user1-reactive
+----
+
+. Expose the incident finder service with a service and a route.
++
+----
+$ oc expose dc incident-finder-service-reactive --port=8080 -n user1-reactive
+$ oc expose service incident-finder-service-reactive -n user1-reactive
+----
+
+. Obtain the URL to the incident finder service:
++
+----
+$ INCIDENT_FINDER_SERVICE_REACTIVE_URL=http://$(oc get route incident-finder-service-reactive -n user1-reactive --template='{{ .spec.host }}')
+----
+
+. Test the incident finder service with `curl`. Expect a HTTP `200 OK` return code:
++
+----
+$ curl -v $INCIDENT_FINDER_SERVICE_REACTIVE_URL/incidents?name=jones
+----
++
+.Sample Output
+----
+*   Trying 18.194.125.175:80...
+* Connected to incident-finder-service-sb-user1-reactive.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 80 (#0)
+> GET /incidents?name=jones HTTP/1.1
+> Host: incident-finder-service-sb-user1-reactive.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 
+< content-type: application/json;charset=UTF-8
+< transfer-encoding: chunked
+< date: Fri, 07 Aug 2020 13:41:57 GMT
+< set-cookie: ef383b94b8dbe9c2cd68229d2e5947d9=a0dff69b7871c1c3d145e1dcbb3c6796; path=/; HttpOnly
+< cache-control: private
+< 
+* Connection #0 to host incident-finder-service-sb-user1-reactive.apps.cluster-03b3.03b3.example.opentlc.com left intact
+[{"id":"43e24efe-aab2-41c3-966d-6fc24f5fdb34","lat":"34.17552","lon":"-77.87287","numberOfPeople":3,"medicalNeeded":true,"victimName":"Theodore Jones","victimPhoneNumber":"(336) 555-8016","timestamp":1596483630894,"status":"RESCUED","destinationLat":34.1706,"destinationLon":-77.949,"destinationName":"Wilmington Marine Center","currentPositionLat":34.1707,"currentPositionLon":-77.9484}]
+----
+
+. At this point you can do some load testing on both versions of the incident finder application. A simple but useful tool for HTTP load testing is _Siege_. On Fedora, you can install Siege with `# dnf install siege`. On MacOS, you can use `$ brew install siege`.
+
+. Run a Siege test against the Spring Boot version of the incident finder service. In this case we use concurrent 20 threads, for a total of 200 calls. Repeat the test a couple of times to allow the service to warm up.
++
+----
+$ siege -r 10 -c 20 -d 0 $INCIDENT_FINDER_SERVICE_SB_URL/incidents?name=jones
+----
++
+A typical output of the Siege test looks like:
++
+----
+Transactions:                    200 hits
+Availability:                 100.00 %
+Elapsed time:                   3.37 secs
+Data transferred:               0.07 MB
+Response time:                  0.26 secs
+Transaction rate:              59.35 trans/sec
+Throughput:                     0.02 MB/sec
+Concurrency:                   15.61
+Successful transactions:         200
+Failed transactions:               0
+Longest transaction:            1.32
+Shortest transaction:           0.07
+----
+
+. Do the same test for the Quarkus version of the service.
++
+----
+$ siege -r 10 -c 20 -d 0 $INCIDENT_FINDER_SERVICE_REACTIVE_URL/incidents?name=jones
+----
++
+A typical result of the Siege test:
++
+----
+Transactions:                    200 hits
+Availability:                 100.00 %
+Elapsed time:                   2.59 secs
+Data transferred:               0.07 MB
+Response time:                  0.24 secs
+Transaction rate:              77.22 trans/sec
+Throughput:                     0.03 MB/sec
+Concurrency:                   18.49
+Successful transactions:         200
+Failed transactions:               0
+Longest transaction:            0.51
+Shortest transaction:           0.07
+----
+
+. You will see very little difference between the blocking and non-blocking versions of the application. In some cases, the non-blocking version might even perform better. +
+The difference will be much more outspoken in case one of the services is slow, as in that case the threads in the blocking version will be blocked for a longer period of time, which will eventually negatively affect performance, especially throughput. The non-blocking version will be a lot less affected by a slow service.
+
+=== Deploy an Envoy Proxy to the Mission Service
+
+In this lab, you use Envoy to simulate a slow service. Envoy is an open source edge and service proxy, which is used as a proxy and sidecar container in Service Mesh. Envoy proxies the traffic to the target service, and can manipulate that traffic. One of the things Envoy allows you to do is to inject errors or delays, providing an easy way to test that your applications behave as expected when upstream applications fail or become slow. +
+
+. Create a configmap with the Envoy static configuration in the `user1-reactive` namespace.
++
+----
+$ echo '
+static_resources:
+  listeners:
+  - address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.config.filter.network.http_connection_manager.v2.HttpConnectionManager
+          codec_type: auto
+          stat_prefix: ingress_http
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: service
+              domains:
+              - "*"
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: mission_service
+          access_log:
+          - name: envoy.access_loggers.file
+            config:
+              path: "/dev/stdout"          
+          http_filters:
+          - name: envoy.filters.http.fault
+            typed_config:
+              "@type": type.googleapis.com/envoy.config.filter.http.fault.v2.HTTPFault
+              abort:
+                http_status: 503
+                percentage:
+                  numerator: 0
+                  denominator: HUNDRED
+              delay:
+                fixed_delay: 3s
+                percentage:
+                  numerator: 0
+                  denominator: HUNDRED
+          - name: envoy.filters.http.router
+            typed_config: {}
+  clusters:
+  - name: mission_service
+    connect_timeout: 0.50s
+    type: strict_dns
+    lb_policy: round_robin
+    load_assignment:
+      cluster_name: local_service
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: mission-service.user1-er-demo.svc
+                port_value: 8080
+admin:
+  access_log_path: "/dev/null"
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 8081
+runtime:
+  symlink_root: /srv/runtime/current
+  subdirectory: envoy
+' | tee /tmp/envoy-standalone.yaml
+$ oc create configmap envoy-standalone -n user1-reactive --from-file=envoy.yaml=/tmp/envoy-standalone.yaml
+----
++
+This configures the Envoy as a proxy to the mission service, and configures the _HTTP Fault_ Envoy filter, which allows to set errors and delays. The proxy itself is listening to port 8080.
+
+. Deploy the Envoy proxy in the `user1-reactive` namespace:
++
+----
+$ echo '
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: envoy
+  labels:
+    app: envoy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: envoy-proxy
+      envoy/kind: envoy-standalone
+  template:
+    metadata:
+      labels:
+        name: envoy-proxy
+        envoy/kind: envoy-standalone
+    spec:
+      containers:
+        - resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          name: envoy-proxy
+          imagePullPolicy: Always
+          terminationMessagePolicy: File
+          image: "quay.io/btison/envoy-fault-injection:latest"
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext: {}
+      schedulerName: default-scheduler
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: envoy-standalone
+            defaultMode: 420
+  strategy:
+    type: Recreate
+' | oc create -f - -n user1-reactive
+----
++
+.Output
+----
+deployment.apps/envoy created
+----
+
+. Expose the Envoy proxy as service and route.
+----
+$ oc expose deployment envoy --port 8080 -n user1-reactive
+$ oc expose service envoy -n user1-reactive
+----
+
+. Test the envoy proxy. Expect a HTTP `200 OK` return code, and the list of missions in the response body.
++
+----
+$ ENVOY_URL=http://$(oc get route envoy -n user1-reactive --template='{{ .spec.host }}')
+$ curl -v -X GET $ENVOY_URL/api/missions
+----
++
+.Sample Output
+----
+Note: Unnecessary use of -X or --request, GET is already inferred.
+*   Trying 18.194.125.175:80...
+* Connected to envoy-user1-reactive.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 80 (#0)
+> GET /api/missions HTTP/1.1
+> Host: envoy-user1-reactive.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< content-type: application/json
+< content-length: 36397
+< x-envoy-upstream-service-time: 23
+< date: Tue, 04 Aug 2020 11:06:31 GMT
+< server: envoy
+< set-cookie: bda4b546495930aad4a78627833fe986=96c5209247670261b784420dedae6412; path=/; HttpOnly
+< cache-control: private
+< 
+[[{"id":"92423720-1f51-4ad9-9761-9a3af4504a96","incidentId":"43e24efe-aab2-41c3-966d-6fc24f5fdb34","responderId":"241","responderStartLat":34.19679,"responderStartLong":-77.83360,"incidentLat":34.17552,"incidentLong":-77.87287,"destinationLat":34.1706,"destinationLong":-77.949,"responderLocationHistory":[{"lat":34.1993,"lon":-77.8486,"timestamp":1596483640318},{"lat":34.1995,"lon":-77.8649,"timestamp":1596483650299},{"lat":34.1928,"lon":-77.8664,"timestamp":1596483660302},{"lat":34.1817,"lon":-77.8612,"timestamp":1596483670312},{"lat":34.1736,"lon":-77.8673,"timestamp":1596483680311},{"lat":34.1754,"lon":-77.8728,"timestamp":1596483690315},{"lat":34.1713,"lon":-77.8815,"timestamp":1596483700313},{"lat":34.1774,"lon":-77.8929,"timestamp":1596483710312},{"lat":34.1819,"lon":-77.9083,"timestamp":1596483720313},{"lat":34.1794,"lon":-77.9212,"timestamp":1596483730308},{"lat":34.1688,"lon":-77.9313,"timestamp":1596483740325},{"lat":34.1643,"lon":-77.9416,"timestamp":1596483750323},{"lat":34.1707,"lon":-77.9484,"timestamp":1596483760322}],"status":"COMPLETED","steps":[{"lat":34.1969,"lon":-77.8342,"wayPoint":false,"destination":false},{"lat":34.1975,"lon":-77.8340,"wayPoint":false,"destination":false},{"lat":34.1992,"lon":-77.8399,"wayPoint":false,"destination":false},{"lat":34.1996,"lon":-77.8715,"wayPoint":false,"destination":false},{"lat":34.1853,"lon":-77.8609,"wayPoint":false,"destination":false},{"lat":34.1817,"lon":-77.8612,"wayPoint":false,"destination":false},{"lat":34.1813,"lon":-77.8644,"wayPoint":false,"destination":false},{"lat":34.1736,"lon":-77.8673,"wayPoint":false,"destination":false},{"lat":34.1754,"lon":-77.8728,"wayPoint":true,"destination":false},{"lat":34.1754,"lon":-77.8728,"wayPoint":false,"destination":false},{"lat":34.1725,"lon":-77.8746,"wayPoint":false,"destination":false},{"lat":34.1738,"lon":-77.8784,"wayPoint":false,"destination":false},{"lat":34.1709,"lon":-77.8803,"wayPoint":false,"destination":false},{"lat":34.1713,"lon":-77.8815,"wayPoint":false,"destination":false},{"lat":34.1738,"lon":-77.8805,"wayPoint":false,"destination":false},{"lat":34.1843,"lon":-77.9166,"wayPoint":false,"destination":false},{"lat":34.1613,"lon":-77.9384,"wayPoint":false,"destination":false},{"lat":34.1707,"lon":-77.9484,"wayPoint":false,"destination":true}]}]
+----
++
+The Envoy proxy acts as a proxy to the mission service.
+
+. To simulate a slow service, you configure the Envoy proxy to inject a delay of 1 second every time the mission service is called.
++
+----
+$ ENVOY_POD=$(oc get pods -n user1-reactive | grep envoy | awk {'print $1'})
+$ oc project user1-reactive
+$ oc exec $ENVOY_POD -- ./enable_delay_fault_injection.sh -d 1000 -p 100
+----
+
+. Repeat the curl call to the mission-service through the Envoy proxy. Expect a delay of approximately 1 second before the call returns.
++
+----
+$ curl -v -X GET $ENVOY_URL/api/missions
+----
+
+. Next step is to configure the incident finder service deployments to use the Envoy proxy rather than calling the mission service directly. For that you need to edit the configmaps for the services.
+* Open the configmap of the Spring Boot version of the incident finder service for edit:
++
+----
+$ oc edit configmap incident-finder-service-sb -n user1-reactive -o yaml
+----
+* Change the url to the mission service to point to the envoy proxy:
++
+----
+# Please edit the object below. Lines beginning with a '#' will be ignored,
+# and an empty file will abort the edit. If an error occurs while saving this file will be
+# reopened with the relevant failures.
+#
+apiVersion: v1
+data:
+  application.properties: |2+
+
+    mission.service.scheme=http
+    mission.service.url=envoy:8080
+    mission.service.path=/api/missions/incident/{id}
+
+    incident.service.scheme=http
+    incident.service.url=incident-service.user1-er-demo.svc:8080
+    incident.service.path=/incidents/byname/{name}
+
+    disaster.service.scheme=http
+    disaster.service.url=disaster-service.user1-er-demo.svc:8080
+    disaster.service.path=/shelters
+
+    server.tomcat.max-threads=15
+
+kind: ConfigMap
+metadata:
+  [...]
+----
+* Save the configmap, and redeploy the service:
++
+----
+$ oc rollout latest dc/incident-finder-service-sb -n user1-reactive
+----
+* Test the incident finder service with `curl`:
++
+----
+$ curl -v $INCIDENT_FINDER_SERVICE_SB_URL/incidents?name=jones 
+----
+* Open the configmap of the Quarkus version of the incident finder service for edit:
++
+----
+$ oc edit configmap incident-finder-service-reactive -n user1-reactive -o yaml
+----
+* Change the url to the mission service to point to the envoy proxy:
++
+----
+# Please edit the object below. Lines beginning with a '#' will be ignored,
+# and an empty file will abort the edit. If an error occurs while saving this file will be
+# reopened with the relevant failures.
+#
+apiVersion: v1
+data:
+  application.properties: |2+
+
+    incident-service.url=incident-service.user1-er-demo.svc
+    mission-service.url=envoy
+    disaster-service.url=disaster-service.user1-er-demo.svc
+    quarkus.vertx.event-loops-pool-size=5
+
+kind: ConfigMap
+metadata:
+  [...]
+----
+* Save the configmap, and redeploy the service:
++
+----
+$ oc rollout latest dc/incident-finder-service-reactive -n user1-reactive
+----
+* Test the incident finder service with `curl`:
++
+----
+$ curl -v $INCIDENT_FINDER_SERVICE_REACTIVE_URL/incidents?name=jones 
+----
+
+. Perform a series of load tests against the Quarkus version of the incident finder service. Start with 5 concurrent threads, and gradually increase the number of concurrent users.
++
+----
+$ siege -r 40 -c 5 -d 0 $INCIDENT_FINDER_SERVICE_REACTIVE_URL/incidents?name=jones
+$ siege -r 20 -c 10 -d 0 $INCIDENT_FINDER_SERVICE_REACTIVE_URL/incidents?name=jones
+$ siege -r 10 -c 20 -d 0 $INCIDENT_FINDER_SERVICE_REACTIVE_URL/incidents?name=jones
+$ siege -r 4 -c 50 -d 0 $INCIDENT_FINDER_SERVICE_REACTIVE_URL/incidents?name=jones
+----
++
+Expect the throughput and latency to be fairly linear when increasing the load. The typical response time will be slightly more than 1 second - in the case the query returns only 1 incident, it will be longer if the call returns several incidents, as the mission service is called once for every incident entity.
++
+A typical result for 20 concurrent users might look like:
++
+----
+Transactions:                    200 hits
+Availability:                 100.00 %
+Elapsed time:                  11.16 secs
+Data transferred:               0.07 MB
+Response time:                  1.10 secs
+Transaction rate:              17.92 trans/sec
+Throughput:                     0.01 MB/sec
+Concurrency:                   19.75
+Successful transactions:         200
+Failed transactions:               0
+Longest transaction:            1.33
+Shortest transaction:           1.07
+----
+
+. Do the same tests for the blocking version of the incident service. 
++
+----
+$ siege -r 40 -c 5 -d 0 $INCIDENT_FINDER_SERVICE_SB_URL/incidents?name=jones
+$ siege -r 20 -c 10 -d 0 $INCIDENT_FINDER_SERVICE_SB_URL/incidents?name=jones
+$ siege -r 10 -c 20 -d 0 $INCIDENT_FINDER_SERVICE_SB_URL/incidents?name=jones
+$ siege -r 4 -c 50 -d 0 $INCIDENT_FINDER_SERVICE_SB_URL/incidents?name=jones
+----
++
+Expect totally different results. Until 10 concurrent users, there should not be a big difference with the non-blocking version. From 20 concurrent users on, you should see a throughput degradation for the blocking service. With 50 concurrent users the service might even become unresponsive.

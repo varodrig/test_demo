@@ -1,0 +1,19 @@
+- hosts: localhost
+  connection: local
+  vars:
+    base_path: ../../
+    source: pages
+    root: modules/ROOT
+    destination: build
+    path_origin: https://github.com/redhat-gpe/cnd_advanced_v2
+    git_msg: "Generated content"
+
+  tasks:
+
+  - name: git commit
+    shell: git add "{{ root }}"; git commit -a -m "'{{ git_msg }}'"
+
+  - name: git push
+    shell: git push --force
+
+

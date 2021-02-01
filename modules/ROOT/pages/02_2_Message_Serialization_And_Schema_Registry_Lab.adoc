@@ -1,0 +1,819 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== Kafka Message Serialization and Schema Registry Lab
+
+.Prerequisites
+* Access to the Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6.x
+
+.Goals
+* Explore Kafka message validation using JSON Schema
+* Explore Apicurio registry for storage and management of schemas
+
+:numbered:
+
+== Use Cases for Apicurio Registry
+
+Apicurio registry is a datastore for sharing standard event schemas and API designs across API and event-driven architectures. A registry allows to decouple the structure of data from the applications and to share and manage data types and API descriptions at runtime using a REST API. 
+
+For example, client applications can dynamically push or pull the latest schema updates to or from the registry at runtime without needing to redeploy. Developer teams can query the registry for existing schemas required for services already deployed in production, and can register new schemas required for new services in development.
+
+Client applications can be enable to use schemas and API designs stored in the registry by specifying the registry URL in the client code. For example, the registry can store schemas used to serialize and deserialize messages, which can then be referenced from client applications to ensure that the messages that they send and receive are compatible with those schemas.
+
+Using a schema registry to decouple the data structure from the applications reduces costs by decreasing overall message size, and creates efficiencies by increasing consistent reuse of schemas and API designs across an organization. 
+
+Apicurio registry provides a web console to make it easy for developers and administrators to manage registry content.
+
+The main features of Apicurio registry:
+
+* Support for multiple payload formats for standard event schemas and API specifications - supported schema types include Avro, Protobuf, JSON Schema, OpenAPI, AsyncAPI 
+* Registry content management by web console, REST API command, Maven plug-in, or Java client
+* Rules for content validation and version compatibility to govern how registry content evolves over time
+* Full Apache Kafka schema registry support, including integration with Kafka Connect for external systems
+* Client serializers/deserializers (SerDes) to validate Kafka and other message types at runtime
+* Cloud-native Quarkus Java runtime for low memory footprint and fast deployment times
+* Compatibility with existing Confluent schema registry client applications
+
+At the time of writing, Apicurio registry is part of the Integration Portfolio, and is Tech Preview.
+
+== Test Environment
+
+In this lab you will add support for JSON Schema and the Apicurio registry to the incident service of the Emergency Response demo. 
+The first step in this lab consists of deploying a test environment on OpenShift. +
+The test environment includes the incident service and its dependencies, namely an AMQ Streams cluster and a PostgreSQL database. You will also deploy the Apicurio registry, and helper applications to test and validate the message flow.
+You probably have done some of the steps already as part of previous labs, like cloning the Ansible installer for the Emergency Response demo. If this is the case, you can skip these steps.
+
+. Make sure you are logged in the OpenShift cluster as a user with admin privileges.
+. Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file:
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+
+. Deploy the AMQ Streams operator:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=schema-registry
+----
++
+This command deploys the AMQ Streams operator in the `user1-schema-registry` namespace. The scope of the operator is the namespace itself.
+
+. Deploy the AMQ Streams cluster:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=schema-registry -e zookeeper_storage_type=ephemeral -e kafka_storage_type=ephemeral
+----
++
+This command deploys a Kafka cluster consisting of 3 ZooKeeper nodes and 3 Kafka broker nodes in the `user1-schema-registry` namespace. Both Zookeeper and the Kafka brokers use ephemeral storage - which is perfectly acceptable in a short-lived development environment. 
+
+. Deploy the Kafka topics:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=schema-registry
+----
++
+This command deploys the Kafka topics used by the Emergency Response application. Every topic is created with 15 partitions and a replication factor of 3.
+
+. Verify the Kafka topics:
++
+----
+$ oc get kafkatopic -n user1-schema-registry
+----
++
+.Sample output
+----
+NAME                              PARTITIONS   REPLICATION FACTOR
+topic-incident-command            15           3
+topic-incident-event              15           3
+topic-mission-command             15           3
+topic-mission-event               15           3
+topic-responder-command           15           3
+topic-responder-event             15           3
+topic-responder-location-update   15           3
+----
+
+. Deploy the PostgreSQL database. 
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/postgresql.yml -e project_admin=user1 -e project_name=schema-registry -e postgresql_storage_type=ephemeral
+----
++
+This command deploys a PostgreSQL version 9.6 database. +
+As part of the deployment of the PostgreSQL instance, the Emergency Response database and tables are created using deployment pod-based lifecycle hooks.
+
+. Deploy the incident service
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/incident_service.yml -e project_admin=user1 -e project_name=schema-registry -e expose_service=true
+----
++
+This command deploys the incident service image and configures the application configuration configmap. The incident service is exposed through a route.
+
+. Deploy the Apicurio registry
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/apicurio-registry.yml -e project_admin=user1 -e project_name=schema-registry -e namespace_tools=user1-schema-registry
+----
++
+This command deploys the Apicurio registry operator in the `user1-schema-registry` project. An `ApicurioRegistry` custom resource is created, which is picked up by the operator. The custom resource looks like:
++
+----
+apiVersion: apicur.io/v1alpha1
+kind: ApicurioRegistry
+metadata:
+  name: apicurio-registry
+spec:
+  configuration:
+    persistence: streams
+    streams:
+      applicationId: apicurio-registry
+      bootstrapServers: 'kafka-cluster-kafka-bootstrap.user1-schema-registry.svc:9092'
+  deployment:
+    replicas: 1
+----
++
+Based on this resource definition, the operator deploys an image of the Apicurio registry. The registry is configured to use AMQ Streams as persistence mechanism.
+
+. Verify the correct deployment of the Apicurio registry.
+* Obtain the URL to the Apicurio registry
++
+----
+$ APICURIO_REGISTRY_ROUTE=$(oc get route -n user1-schema-registry | grep apicurio-registry | awk {'print $1'})
+$ APICURIO_REGISTRY_URL=$(oc get route ${APICURIO_REGISTRY_ROUTE} -n user1-schema-registry --template='{{ .spec.host }}')
+$ echo http://${APICURIO_REGISTRY_URL}
+----
+* Open a browser window and enter the Apicurio registry URL in the address bar. Expect to see the home page of the registry.
++
+image::images/apicurio-registry-homepage.png[]
+
+== Implement JSON Schema in the Incident Service
+
+The incident service produces two kind of messages: an _IncidentReportedEvent_ message whenever a new incident is created, and an _IncidentUpdatedEvent_ message when an incident has been updated. In this section of the lab, you create a JSON Schema document for the _IncidentReportedEvent_ message type and store the schema in the Apicurio registry. Next you change the implementation of the incident service to take into account the schema when producing  _IncidentReportedEvent_ messages.
+
+. Check out the code for the incident service:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/incident-service.git
+$ cd incident-service
+----
+. Import the code into your IDE of choice.
+. Ensure the code builds correctly and the unit tests are succeeding:
++
+----
+$ mvn clean package
+----
+. Familiarize yourself with the code. The incident service is implemented using Quarkus, and follows a layered approach. Some classes of interest include:
+* `IncidentsResource`: REST API layer, implemented using JAX-RS. Note that this layer communicates with the other parts of the application using the Quarkus Vert.x EventBus (https://quarkus.io/guides/reactive-messaging).
+* `IncidentRepository` and `Incident`: persistence layer, implemented using JPA. 
+* `EventBusConsumer`: consumes EventBus messages and dispatches them to the service layer.
+* `IncidentService`: service layer.
+* `IncidentCommandMessageSource`: message consumer for _UpdateIncidentCommand_ messages. Uses Quarkus reactive messaging.
+* `EventBusConsumer` and `IncidentCommandMessageSource` contain code to produce outgoing Kafka messages, using Quarkus reactive messaging.
+
+. Create the JSON Schema document for the _IncidentReportedEvent_ message type. +
+A JSON Schema can be created from an example JSON document. There are several tools available online that offer that service. One of them is https://www.jsonschema.net.
+* Copy the example of an _IncidentReportedEvent_ message:
++
+----
+{
+    "messageType": "IncidentReportedEvent",
+    "id": "messageId",
+    "invokingService": "messageSender",
+    "timestamp": 1521148332397,
+    "body": {
+        "id": "incident123",
+        "lat": 34.14338,
+        "lon": -77.86569,
+        "numberOfPeople": 3,
+        "medicalNeeded": true,
+        "timestamp": 1521148332350,
+        "victimName": "John Doe",
+        "victimPhoneNumber": "111-222-333",
+        "status": "REPORTED"
+    }
+}
+----
+* In a browser window, navigate to https://www.jsonschema.net, and paste the example JSON document in the left pane of the page. Click the _Submit_ button at the bottom of the pane. A corresponding JSON schema will be generated in the right pane of the page.
++
+image::images/generate-json-schema.png[]
+* Copy the contents of the generated schema and paste it in a file within the `src/main/resources` folder of the incident service project.
+* Change the `title` property value in the schema to `IncidentReportedEvent`. This will become the display name of the artifact in the registry. 
++
+----
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "$id": "http://example.com/example.json",
+  "type": "object",
+  "title": "IncidentReportedEvent",
+  "description": "Schema for IncidentReportedEvent message.",
+  [...]]
+}
+----
+* A JSON Schema serves as documentation of a JSON document, so feel free to add meaningful descriptions to the `title` and `description` elements in the Schema document.
+
+. Upload the JSON Schema to the Apicurio registry. +
+The Apicurio registry offers various ways to upload assets to the registry: through the UI, using a maven plugin, using the REST API. In this lab we use the REST API. +
+Make sure that the value of the `-d` curl command parameter points to the JSON Schema file. +
+The `X-Registry-ArtifactType` header defines the type of the artifact. The `X-Registry-ArtifactId` header defines the global artifact ID to use for this schema. This ID will allow to retrieve the artifact from the registry.
++
+----
+$ APICURIO_REGISTRY_ROUTE=$(oc get route -n user1-schema-registry | grep apicurio-registry | awk {'print $1'})
+$ APICURIO_REGISTRY_URL=$(oc get route ${APICURIO_REGISTRY_ROUTE} -n user1-schema-registry --template='{{ .spec.host }}')
+$ curl -v -X POST -H "X-Registry-ArtifactType: JSON" -H "X-Registry-ArtifactId: IncidentReportedEvent" -H "Content-type: application/json" -d @src/main/resources/IncidentReportedEvent-jsonschema.json http://${APICURIO_REGISTRY_URL}/api/artifacts 
+----
++
+.Sample output
+----
+Note: Unnecessary use of -X or --request, POST is already inferred.
+*   Trying 35.158.5.133:80...
+* Connected to apicurio-registry.user1-schema-registry.apps.cluster-03b3.03b3.example.opentlc.com (35.158.5.133) port 80 (#0)
+> POST /api/artifacts HTTP/1.1
+> Host: apicurio-registry.user1-schema-registry.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> X-Registry-ArtifactType: JSON
+> Content-type: application/json
+> Content-Length: 5679
+> 
+* upload completely sent off: 5679 out of 5679 bytes
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< date: Wed, 01 Jul 2020 08:33:53 GMT
+< expires: Tue, 30 Jun 2020 08:33:53 GMT
+< pragma: no-cache
+< cache-control: no-cache, no-store, must-revalidate
+< content-type: application/json
+< content-length: 245
+< set-cookie: 48d464614e9c55eed8a855d7c4a0b1a8=1c3998ecfac5dec86e81f20dbc5384da; path=/; HttpOnly
+< 
+* Connection #0 to host apicurio-registry.user1-schema-registry.apps.cluster-03b3.03b3.example.opentlc.com left intact
+{"name":"IncidentReportedEvent","description":"Schema for IncidentReportedEvent message.","createdOn":1593592433895,"modifiedOn":1593592433895,"id":"a0dfc09c-f345-4e0d-a271-29cacfb22a66","version":1,"type":"JSON","globalId":16,"state":"ENABLED"}
+----
+. Check the Apicurio registry UI, and expect to find the uploaded schema:
++
+image::images/apicurio-ui-schema-uploaded.png[] 
+
+. Now that you have a JSON Schema describing the _IncidentReportedEvent_ message, you can apply schema validation to both Kafka message producers and consumers. +
+On the producer side, the message payload is validated against the schema. The ID of the schema in the registry is added as a Kafka message header to the outgoing message. +
+On the consumer side, the schema is retrieved from the registry (and kept in a local cache) and the message payload is validated against the schema. +
+The Apicurio registry project comes with a number of Kafka serializer and deserializer implementations to help with these tasks.
++
+* Add a dependency to the Apicurio `apicurio-registry-client` and `apicurio-registry-utils-serde`, as well as the `org.jboss.logging:commons-logging-jboss-logging` libraries to the `pom.xml` file of the incident service project.
++
+----
+    <dependency>
+      <groupId>io.apicurio</groupId>
+      <artifactId>apicurio-registry-client</artifactId>
+      <version>1.3.2.Final</version>
+    </dependency>
+    <dependency>
+      <groupId>io.apicurio</groupId>
+      <artifactId>apicurio-registry-utils-serde</artifactId>
+      <version>1.3.2.Final</version>
+    </dependency>
+    <dependency>
+      <groupId>org.jboss.logging</groupId>
+      <artifactId>commons-logging-jboss-logging</artifactId>
+    </dependency>
+----
+* The Apicurio libraries provide a `JsonSchemaKafkaSerializer` class that can be leveraged on the message producer. However, in the case of the incident service, we need to make a small adjustment to this serializer. +
+The `JsonSchemaKafkaSerializer` implementation provides a pluggable strategy to find out what schema to use for a particular payload. The default strategy is based solely on the name of the topic to which the message is sent to and the schema itself. As an example, it expects the schema name for a message sent to the `some-topic` topic to be `some-topic-value`. +
+This strategy is not suited for the Emergency Response demo. In the Emergency Response demo, a single topic can be used for different kind of messages. As an example, both the _IncidentReportedEvent_ and the _IncidentUpdatedEvent_ message types are sent to the `topic-incident-event` topic. +
+So you need a different strategy, where the schema name can be derived from the message payload itself. +
+To do this, you need to subclass the Apicurio serializer. +
+Create a class `JsonSchemaKafkaSerializer` in the `com.redhat.emergency.response.incident.message` package of the incident service project. The class extends `io.apicurio.registry.utils.serde.JsonSchemaKafkaSerializer<Message<T>`.
++
+----
+package com.redhat.emergency.response.incident.message;
+
+public class JsonSchemaKafkaSerializer<U extends Message<T>, T> extends io.apicurio.registry.utils.serde.JsonSchemaKafkaSerializer<Message<T>> {
+    
+}
+----
+* Override the `getArtifactId` method of the superclass to return the message type. For an instance of _IncidentReportedEvent_ this will return `IncidentReportedEvent`.
++
+----
+    @Override
+    protected String getArtifactId(String topic, Message<T> data) {
+        return data.getMessageType();
+    }
+----
+
+. In the current implementation of the incident service, the message payload is serialized to String before being sent to the Kafka client. The `JsonSchemaKafkaSerializer` however expects a POJO of type `Message<T>` as payload. The Kafka message producer code is in the `com.redhat.emergency.response.incident.service.EventBusConsumer` class. Change the `source` and `toMessage` methods accordingly:
++
+----
+    @Outgoing("incident-event-1")
+    public  Multi<org.eclipse.microprofile.reactive.messaging.Message<com.redhat.emergency.response.incident.message.Message<?>>> source() {
+        return processor.onItem().apply(this::toMessage);
+    }
+
+    private org.eclipse.microprofile.reactive.messaging.Message<com.redhat.emergency.response.incident.message.Message<?>> toMessage(JsonObject incident) {
+        com.redhat.emergency.response.incident.message.Message<IncidentEvent> message
+                = new com.redhat.emergency.response.incident.message.Message.Builder<>("IncidentReportedEvent", "IncidentService",
+                    new IncidentEvent.Builder(incident.getString("id"))
+                        .lat(new BigDecimal(incident.getString("lat")))
+                        .lon(new BigDecimal(incident.getString("lon")))
+                        .medicalNeeded(incident.getBoolean("medicalNeeded"))
+                        .numberOfPeople(incident.getInteger("numberOfPeople"))
+                        .timestamp(incident.getLong("timestamp"))
+                        .victimName(incident.getString("victimName"))
+                        .victimPhoneNumber(incident.getString("victimPhoneNumber"))
+                        .status(incident.getString("status"))
+                        .build())
+                .build();
+        return KafkaRecord.of(incident.getString("id"), message);
+    }
+----
+. Fix the tests in `EventBusConsumerTest`.
+. Make similar changes to `com.redhat.emergency.response.incident.consumer.IncidentCommandMessageSource` to handle _IncidentUpdatedEvent_ messages. Fix the tests.
+. Configure the application to use your version of `JsonSchemaKafkaSerializer` to serialize outgoing Kafka messages. +
+Make the following changes in `src/main/resources/application.properties`:
++
+----
+[...]
+
+# Configure the Kafka sinks
+mp.messaging.outgoing.incident-event.connector=smallrye-kafka
+mp.messaging.outgoing.incident-event.key.serializer=org.apache.kafka.common.serialization.StringSerializer
+mp.messaging.outgoing.incident-event.value.serializer=com.redhat.emergency.response.incident.message.JsonSchemaKafkaSerializer
+mp.messaging.outgoing.incident-event.apicurio.registry.serdes.json-schema.validation-enabled=true
+mp.messaging.outgoing.incident-event.acks=1
+
+mp.messaging.outgoing.incident-event-1.connector=smallrye-kafka
+mp.messaging.outgoing.incident-event-1.key.serializer=org.apache.kafka.common.serialization.StringSerializer
+mp.messaging.outgoing.incident-event-1.value.serializer=com.redhat.emergency.response.incident.message.JsonSchemaKafkaSerializer
+mp.messaging.outgoing.incident-event-1.apicurio.registry.serdes.json-schema.validation-enabled=true
+mp.messaging.outgoing.incident-event-1.acks=1
+----
++
+`mp.messaging.outgoing.incident-event.apicurio.registry.serdes.json-schema.validation-enabled` is a configuration setting for the Apicurio serializer which enables validation of the payload against the schema prior to serialization.
+
+. Before deploying the new version of the incident service to the OpenShift cluster, we need to configure the application with the location of the Apicurio registry.
+* Obtain the Apicurio registry service name:
++
+----
+$ APICURIO_REGISTRY_SERVICE=$(oc get service -n user1-schema-registry | grep apicurio-registry-service | awk {'print $1'})
+$ echo ${APICURIO_REGISTRY_SERVICE}
+----
+* Edit the `incident-service` configmap in the `user1-schema-registry` project. Add the following line to the configmap:
++
+----
+mp.messaging.outgoing.incident-event.apicurio.registry.url=http://<Apicurio registry service name>.user1-schema-registry.svc:8080/api
+mp.messaging.outgoing.incident-event-1.apicurio.registry.url=http://<Apicurio registry service name>.user1-schema-registry.svc:8080/api
+----
+
+. Build and deploy the incident service image with the JSON Schema implementation. The commands hereunder use rootless _podman_ to build the image locally and push it to the registry on OpenShift. Refer to the first lab of the course for alternative ways to deploy to OpenShift.
++
+----
+$ mvn clean package
+$ podman build -f docker/Dockerfile -t incident-service:registry .
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman tag incident-service:registry ${REGISTRY_URL}/user1-schema-registry/incident-service:registry
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-schema-registry/incident-service:registry
+----
+
+. Patch the incident service deploymentconfig to point to the new image. This will force a redeployment of the incident service application. 
++
+----
+$ oc patch dc incident-service --type='json' -p '[{"op": "replace", "path": "/spec/triggers/1/imageChangeParams/from/name", "value": "incident-service:registry"}]' -n user1-schema-registry
+----
+
+. Deploy the Kafka consumer application. The Kafka consumer application is a simple Quarkus application that consumes messages from a given topic and logs the payload and metadata of each message to _stdout_.
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_consumer_app.yml -e project_admin=user1 -e project_name=schema-registry -e kafka_topic=topic-incident-event
+----
+
+. To have the incident service produce an _IncidentReportedEvent_ message, you have to create an incident by calling the REST API of the incident service.
++
+----
+$ echo '
+{
+  "lat": 34.98125,
+  "lon": -77.84121,
+  "numberOfPeople": 5,
+  "medicalNeeded": true,
+  "victimName": "Jane Foo",
+  "victimPhoneNumber": "(458) 741-45823)"
+}
+' | tee /tmp/incident.json
+$ INCIDENT_SERVICE_URL=$(oc get route incident-service -n user1-schema-registry --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/incident.json http://${INCIDENT_SERVICE_URL}/incidents
+----
+
+. Check the logs of the Kafka consumer app. Notice that the Kafka message contains two headers, set by the Apicurio deserializer. The `apicurio.globalId` is the global identifier of the schema in the registry. It allows the message deserializer on the consumer to retrieve the schema from the registry, and validate the message. The `apicurio.messageType` represents the fully qualified class name of the message payload. This value can potentially be used to deserialize the payload back into a POJO - provided that the POJO class definition is available on the consumer classpath.
+----
+2020-07-01 18:19:18,671 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-4) Consumed message from topic 'topic-incident-event', partition '1', offset '0'
+2020-07-01 18:19:18,672 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-4)     Headers: apicurio.globalId: 15, apicurio.messageType: com.redhat.emergency.response.incident.message.Message
+2020-07-01 18:19:18,672 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-4)     Message key: 8ea8b7ba-7e40-4ec9-9f07-bbc859714464
+2020-07-01 18:19:18,672 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-4)     Message value: {"id":"f68091dc-6ffb-4c2d-be7a-cbc13195f0d1","messageType":"IncidentReportedEvent","invokingService":"IncidentService","timestamp":1593627558517,"body":{"id":"8ea8b7ba-7e40-4ec9-9f07-bbc859714464","lat":34.98125,"lon":-77.84121,"numberOfPeople":5,"medicalNeeded":true,"timestamp":1593627558513,"victimName":"Jane Foo","victimPhoneNumber":"(458) 741-45823)","status":"REPORTED"}}
+----
+
+== Validating Kafka messages with JSON Schema
+
+In the Emergency Response demo, the main consumer of _IncidentReportedEvent_ messages is the process service. However the process service has a lot of dependencies to other services and it is quite complex to install and use in isolation. So for the sake of simplicity you will use a simple consumer application to test JSON Schema validation on the consumer side.
+
+. Check out the code of the kafka consumer app. This is the same application you used above to consume messages from the `topic-incident-event` topic.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/kafka-consumer-app.git
+$ cd kafka-consumer-app
+----
+. Import the code into your IDE of choice.
+. Ensure the code builds correctly:
++
+----
+$ mvn clean package
+----
+. Review the code. The application is implemented using Quarkus, and has only one class. It uses Quarkus reactive messaging to consume messages from a topic and logs the message key, headers and payload to _stdout_.
+. The application uses the standard Kafka client `StringDeserializer` to deserialize the message payload into a string. In order to leverage JSON schema validation, you need to use a JSON Schema aware deserializer. +
+The Apicurio project provides a `JsonSchemaKafkaDeSerializer` for that purpose. However, the implementation of that serializer not only validates the payload against the schema, but also tries to deserialize the payload into an instance of the class with a fully qualified name corresponding to the value of the `apicurio.messageType` Kafka message header. +
+This is less than ideal as it requires that class to be on the consumer classpath, which often isn't desirable - shared model libraries are generally not considered a very good practice in distributed applications. +
+Instead, you create a subclass of the Apicurio deserializer, and modify it to do only validation, and return the message payload as a JSON String.
+* Add a dependency to the `apicurio-registry-client` and `apicurio-registry-utils-serde` dependencies to the project `pom.xml` file:
++
+----
+    <dependency>
+      <groupId>io.apicurio</groupId>
+      <artifactId>apicurio-registry-client</artifactId>
+      <version>1.3.2.Final</version>
+    </dependency>
+    <dependency>
+      <groupId>io.apicurio</groupId>
+      <artifactId>apicurio-registry-utils-serde</artifactId>
+      <version>1.3.2.Final</version>
+    </dependency>
+----
+* Create a class `JsonSchemaKafkaStringDeserializer` in the package `com.redhat.emergency.response.kafka` which extends `io.apicurio.registry.utils.serde.JsonSchemaKafkaDeserializer<String>`.
++
+----
+package com.redhat.emergency.response.kafka;
+
+import io.apicurio.registry.utils.serde.JsonSchemaKafkaDeserializer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class JsonSchemaKafkaStringDeserializer extends JsonSchemaKafkaDeserializer<String> {
+
+    private static final Logger log = LoggerFactory.getLogger(JsonSchemaKafkaStringDeserializer.class);
+
+}
+----
+* Override the `deserialize(String topic, Headers headers, byte[] data)` and `deserialize(String topic, byte[] data)` methods. The implementation obtains the schema based on the global ID of the schema, and validates the payload. It returns the String representation of the message payload if validation succeeds, or _null_ if validation fails or the schema cannot be retrieved from the registry.
++
+----
+    @Override
+    public String deserialize(String topic, Headers headers, byte[] data) {
+
+        if (data == null) {
+            return null;
+        }
+
+        try {
+            if (isValidationEnabled()) {
+                Long globalId = getGlobalId(headers);
+
+                SchemaValidator schema = getSchemaCache().getSchema(globalId);
+                JsonParser parser = api.createJsonParser(schema, new StreamInputSource(new ByteArrayInputStream(data)));
+                api.parseAll(parser);
+                log.info("Message validated. Schema id: " + globalId);
+            }
+            return new String(data);
+        } catch (RuntimeException e) {
+            log.error("Exception while validating incoming message", e);
+            //ignore the message in case of validation exceptions
+            return null;
+        }
+    }
+----
+. Configure the application to use the `JsonSchemaKafkaStringDeserializer` to deserialize incoming Kafka messages.
+* Change the configuration setting for the value deserializer in `src/main/resources/application.properties`:
++
+----
+mp.messaging.incoming.channel.value.deserializer=com.redhat.emergency.response.kafka.JsonSchemaKafkaStringDeserializer
+mp.messaging.incoming.channel.apicurio.registry.serdes.json-schema.validation-enabled=true
+----
+* Obtain the Apicurio registry service name:
++
+----
+$ APICURIO_REGISTRY_SERVICE=$(oc get service -n user1-schema-registry | grep apicurio-registry-service | awk {'print $1'})
+$ echo ${APICURIO_REGISTRY_SERVICE}
+----
+* Edit the `kafka-consumer-app` configmap in the `user1-schema-registry` project. Add the following line to the configmap:
++
+----
+mp.messaging.incoming.channel.apicurio.registry.url=http://<Apicurio registry service name>.user1-schema-registry.svc:8080/api
+----
+
+. Build and deploy the Kafka consumer app image. The commands hereunder use rootless _podman_ to build the image locally and push it to the registry on OpenShift. Refer to the first lab of the course for alternative ways to deploy to OpenShift.
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-schema-registry/kafka-consumer-app:validation .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-schema-registry/kafka-consumer-app:validation
+----
+
+. Patch the Kafka consumer app deploymentconfig to point to the new image. This will force a redeployment of the application. 
++
+----
+$ oc patch dc kafka-consumer-app --type='json' -p '[{"op": "replace", "path": "/spec/triggers/1/imageChangeParams/from/name", "value": "kafka-consumer-app:validation"}]' -n user1-schema-registry
+----
+
+. To have the incident service produce an _IncidentReportedEvent_ message, you have to create an incident by calling the REST API of the incident service.
++
+----
+$ echo '
+{
+  "lat": 34.98125,
+  "lon": -77.84121,
+  "numberOfPeople": 5,
+  "medicalNeeded": true,
+  "victimName": "Jane Foo",
+  "victimPhoneNumber": "(458) 741-45823)"
+}
+' | tee /tmp/incident.json
+$ INCIDENT_SERVICE_URL=$(oc get route incident-service -n user1-schema-registry --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/incident.json http://${INCIDENT_SERVICE_URL}/incidents
+----
+
+. Check the logs of the kafka consumer app. Notice the log statement indicating the message was successfully validated.
++
+----
+2020-07-02 11:25:58,585 INFO  [com.red.eme.res.kaf.JsonSchemaKafkaStringDeserializer] (vert.x-kafka-consumer-thread-0) Message validated. Schema id: 15
+2020-07-02 11:25:58,586 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-5) Consumed message from topic 'topic-incident-event', partition '10', offset '0'
+2020-07-02 11:25:58,586 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-5)     Headers: apicurio.globalId: 15, apicurio.messageType: com.redhat.emergency.response.incident.message.Message
+2020-07-02 11:25:58,586 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-5)     Message key: 780e6253-06a6-4c9d-bfb2-99e92244a7fc
+2020-07-02 11:25:58,587 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-5)     Message value: {"id":"9f58f2b8-885b-492d-bd6a-b83fbd665945","messageType":"IncidentReportedEvent","invokingService":"IncidentService","timestamp":1593689158565,"body":{"id":"780e6253-06a6-4c9d-bfb2-99e92244a7fc","lat":34.98125,"lon":-77.84121,"numberOfPeople":5,"medicalNeeded":true,"timestamp":1593689158561,"victimName":"Jane Foo","victimPhoneNumber":"(458) 741-45823)","status":"REPORTED"}}
+----
+
+. To test what happens if validation fails, we can use the kafka producer app, a simple Quarkus application that exposes a REST endpoint and sends the payload of the REST call as a Kafka message to a given topic. +
+Deploy the Kafka producer application:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_producer_app.yml -e project_admin=user1 -e project_name=schema-registry -e kafka_topic=topic-incident-event
+----
+
+. Send a message to the `topic-incident-event` that is not matching the JSON Schema for _IncidentReportedEvent_. In this case the message is missing the required `body` field. Ensure that the `apicurio.globalId` header matches the global ID of the IncidentReportedEvent schema in the registry.  
++
+----
+$ echo '
+{
+  "key":"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43",
+  "headers": {
+    "apicurio.globalId": 15
+  },
+  "value":{
+    "messageType" : "UpdateReportedEvent",
+    "id":"messageId",
+    "invokingService":"test",
+    "timestamp":1521148332397
+  }  
+}
+' | tee /tmp/bad-message.json
+$ KAFKA_PRODUCER_APP=$(oc get route kafka-producer-app -n user1-schema-registry --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/bad-message.json ${KAFKA_PRODUCER_APP}/produce
+----
+
+. Check the logs of the kafka consumer app. Notice the log error statement indicating the message could not be validated, along with the validation error. Also notice that the message payload passed to the consumer is _null_;
++
+----
+2020-07-02 12:13:26,997 ERROR [com.red.eme.res.kaf.JsonSchemaKafkaStringDeserializer] (vert.x-kafka-consumer-thread-0) Exception while validating incoming message: com.worldturner.medeia.api.ValidationFailedException: [Validation Failure
+------------------
+Rule:     required
+Property: body
+Message:  Required property body is missing from object
+Location: at 1:106
+]
+	at com.worldturner.medeia.schema.validation.stream.SchemaValidatingConsumer.consume(SchemaValidatingJsonConsumer.kt:31)
+	at com.worldturner.medeia.parser.jackson.JacksonTokenDataJsonParser.nextToken(JacksonTokenDataJsonParser.kt:42)
+	at com.worldturner.medeia.api.jackson.MedeiaJacksonApi.parseAll(MedeiaJacksonApi.kt:65)
+	at com.redhat.emergency.response.kafka.JsonSchemaKafkaStringDeserializer.deserialize(JsonSchemaKafkaStringDeserializer.java:37)
+	at com.redhat.emergency.response.kafka.JsonSchemaKafkaStringDeserializer.deserialize(JsonSchemaKafkaStringDeserializer.java:13)
+	at org.apache.kafka.clients.consumer.internals.Fetcher.parseRecord(Fetcher.java:1310)
+	at org.apache.kafka.clients.consumer.internals.Fetcher.access$3500(Fetcher.java:128)
+	at org.apache.kafka.clients.consumer.internals.Fetcher$CompletedFetch.fetchRecords(Fetcher.java:1541)
+	at org.apache.kafka.clients.consumer.internals.Fetcher$CompletedFetch.access$1700(Fetcher.java:1377)
+	at org.apache.kafka.clients.consumer.internals.Fetcher.fetchRecords(Fetcher.java:677)
+	at org.apache.kafka.clients.consumer.internals.Fetcher.fetchedRecords(Fetcher.java:632)
+	at org.apache.kafka.clients.consumer.KafkaConsumer.pollForFetches(KafkaConsumer.java:1290)
+	at org.apache.kafka.clients.consumer.KafkaConsumer.poll(KafkaConsumer.java:1248)
+	at org.apache.kafka.clients.consumer.KafkaConsumer.poll(KafkaConsumer.java:1173)
+	at io.vertx.kafka.client.consumer.impl.KafkaReadStreamImpl.lambda$pollRecords$6(KafkaReadStreamImpl.java:146)
+	at java.base/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:515)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+	at java.base/java.lang.Thread.run(Thread.java:834)
+
+2020-07-02 12:13:26,999 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-6) Consumed message from topic 'topic-incident-event', partition '11', offset '4'
+2020-07-02 12:13:26,999 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-6)     Headers: apicurio.globalId: 15
+2020-07-02 12:13:27,000 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-6)     Message key: 829fce70-83ae-49dd-b0dc-6dfbdfd7dc43
+2020-07-02 12:13:27,000 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-6)     Message value: null
+----
+
+. Repeat the test, but now send a message without headers.
++
+----
+$ echo '
+{
+  "key":"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43",
+  "value":{
+    "messageType" : "UpdateReportedEvent",
+    "id":"messageId",
+    "invokingService":"test",
+    "timestamp":1521148332397
+  }  
+}
+' | tee /tmp/no-headers.json
+$ KAFKA_PRODUCER_APP=http://$(oc get route kafka-producer-app -n user1-schema-registry --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/no-headers.json ${KAFKA_PRODUCER_APP}/produce
+----
+
+. Check the logs of the kafka consumer app. Notice the log error statement indicating the schema could not be loaded. Also notice that the message payload passed to the consumer is _null_;
++
+----
+2020-07-02 12:20:07,788 ERROR [com.red.eme.res.kaf.JsonSchemaKafkaStringDeserializer] (vert.x-kafka-consumer-thread-0) Exception while validating incoming message: java.lang.NullPointerException
+	at com.redhat.emergency.response.kafka.JsonSchemaKafkaStringDeserializer.deserialize(JsonSchemaKafkaStringDeserializer.java:35)
+	at com.redhat.emergency.response.kafka.JsonSchemaKafkaStringDeserializer.deserialize(JsonSchemaKafkaStringDeserializer.java:13)
+	at org.apache.kafka.clients.consumer.internals.Fetcher.parseRecord(Fetcher.java:1310)
+	at org.apache.kafka.clients.consumer.internals.Fetcher.access$3500(Fetcher.java:128)
+	at org.apache.kafka.clients.consumer.internals.Fetcher$CompletedFetch.fetchRecords(Fetcher.java:1541)
+	at org.apache.kafka.clients.consumer.internals.Fetcher$CompletedFetch.access$1700(Fetcher.java:1377)
+	at org.apache.kafka.clients.consumer.internals.Fetcher.fetchRecords(Fetcher.java:677)
+	at org.apache.kafka.clients.consumer.internals.Fetcher.fetchedRecords(Fetcher.java:632)
+	at org.apache.kafka.clients.consumer.KafkaConsumer.pollForFetches(KafkaConsumer.java:1315)
+	at org.apache.kafka.clients.consumer.KafkaConsumer.poll(KafkaConsumer.java:1248)
+	at org.apache.kafka.clients.consumer.KafkaConsumer.poll(KafkaConsumer.java:1173)
+	at io.vertx.kafka.client.consumer.impl.KafkaReadStreamImpl.lambda$pollRecords$6(KafkaReadStreamImpl.java:146)
+	at java.base/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:515)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+	at java.base/java.lang.Thread.run(Thread.java:834)
+
+2020-07-02 12:20:07,795 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-8) Consumed message from topic 'topic-incident-event', partition '11', offset '6'
+2020-07-02 12:20:07,795 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-8)     Headers: 
+2020-07-02 12:20:07,795 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-8)     Message key: 829fce70-83ae-49dd-b0dc-6dfbdfd7dc43
+2020-07-02 12:20:07,795 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-8)     Message value: null
+----
+
+== Schema Evolution
+
+What happens if the schema evolves? On the producer side, the default implementation of the Apicurio `JsonSchemaKafkaSerializer` will always fetch the latest version of a schema based on the artifact ID. But other strategies are also possible, for instance if the producer is not ready yet to move to the new version. On the consumer side, the deserializer finds the correct schema based on the global ID of the schema, which will be different for different versions. Obviously, if several versions of a schema are being used concurrently this brings additional complexity for the consumers, which need to be able to handle different versions. Patterns such as tolerant reader and contract testing will help ensure that new versions of a schema do not break existing consumers.
+
+In this section of the lab you will create a new version of the _IncidentReportedEvent_ schema, and see how it affects producers and consumers.
+
+. Locate the schema definition in the `src/main/resources` directory of the incident service project.
+. Make a change to the schema. As an example, you can restrict the value of the `messageType` field to the value of `IncidentReportedEvent`:
++
+----
+    [...]
+    "messageType": {
+      "$id": "#/properties/messageType",
+      "type": "string",
+      "title": "The messageType schema",
+      "description": "The message type.",
+      "const": "IncidentReportedEvent"
+    },
+    [...]
+----
+. Upload the new version of the schema to the Apicurio registry.
++
+----
+$ APICURIO_REGISTRY_ROUTE=$(oc get route -n user1-schema-registry | grep apicurio-registry | awk {'print $1'})
+$ APICURIO_REGISTRY_URL=$(oc get route ${APICURIO_REGISTRY_ROUTE} -n user1-schema-registry --template='{{ .spec.host }}')
+$ curl -v -X PUT -H "X-Registry-ArtifactType: JSON" -H "Content-type: application/json" -d @src/main/resources/IncidentReportedEvent-jsonschema.json http://${APICURIO_REGISTRY_URL}/api/artifacts/IncidentReportedEvent
+----
++
+.Sample output
+----
+*   Trying 18.194.125.175:80...
+* Connected to apicurio-registry.user1-schema-registry.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 80 (#0)
+> PUT /api/artifacts/IncidentReportedEvent HTTP/1.1
+> Host: apicurio-registry.user1-schema-registry.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> X-Registry-ArtifactType: JSON
+> Content-type: application/json
+> Content-Length: 5607
+> 
+* upload completely sent off: 5607 out of 5607 bytes
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< date: Thu, 02 Jul 2020 14:55:33 GMT
+< expires: Wed, 01 Jul 2020 14:55:33 GMT
+< pragma: no-cache
+< cache-control: no-cache, no-store, must-revalidate
+< content-type: application/json
+< content-length: 234
+< set-cookie: 48d464614e9c55eed8a855d7c4a0b1a8=1c3998ecfac5dec86e81f20dbc5384da; path=/; HttpOnly
+< 
+* Connection #0 to host apicurio-registry.user1-schema-registry.apps.cluster-03b3.03b3.example.opentlc.com left intact
+{"name":"IncidentReportedEvent","description":"Schema for IncidentReportedEvent message.","createdOn":1593701733884,"modifiedOn":1593701733884,"id":"IncidentReportedEvent","version":2,"type":"JSON","globalId":327695,"state":"ENABLED"}
+----
+
+. Verify in the Apicurio registry UI that there are two versions for the IncidentReportedEvent schema.
++
+image::images/apicurio-ui-schema-version.png[]
+
+. To have the incident service produce an _IncidentReportedEvent_ message, you have to create an incident by calling the REST API of the incident service.
++
+----
+$ echo '
+{
+  "lat": 34.98125,
+  "lon": -77.84121,
+  "numberOfPeople": 5,
+  "medicalNeeded": true,
+  "victimName": "Jane Foo",
+  "victimPhoneNumber": "(458) 741-45823)"
+}
+' | tee /tmp/incident.json
+$ INCIDENT_SERVICE_URL=$(oc get route incident-service -n user1-schema-registry --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/incident.json http://${INCIDENT_SERVICE_URL}/incidents
+----
+
+. Check the logs of the kafka consumer app. Notice that the value of the `apicurio.globalId` header is different than the previous tests.
++
+----
+2020-07-02 15:12:11,988 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-11) Consumed message from topic 'topic-incident-event', partition '12', offset '0'
+2020-07-02 15:12:11,989 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-11)     Headers: apicurio.globalId: 327695, apicurio.messageType: com.redhat.emergency.response.incident.message.Message
+2020-07-02 15:12:11,989 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-11)     Message key: 9f2bfc81-2e57-4350-804f-4f618e080f59
+2020-07-02 15:12:11,989 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-11)     Message value: {"id":"e0f9e469-b7fa-4086-bb6f-92ff4ffcc22b","messageType":"IncidentReportedEvent","invokingService":"IncidentService","timestamp":1593702731964,"body":{"id":"9f2bfc81-2e57-4350-804f-4f618e080f59","lat":34.98125,"lon":-77.84121,"numberOfPeople":5,"medicalNeeded":true,"timestamp":1593702731960,"victimName":"Jane Foo","victimPhoneNumber":"(458) 741-45823)","status":"REPORTED"}}
+----
+
+. Using the Apicurio registry REST API, verify that the global ID value corresponds to the second version of the schema:
++
+----
+$ curl -v -X GET http://${APICURIO_REGISTRY_URL}/api/ids/327695/meta | jq
+----
++
+.Sample output
+----
+* Connected to apicurio-registry.user1-schema-registry.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 80 (#0)
+> GET /api/ids/327695/meta HTTP/1.1
+> Host: apicurio-registry.user1-schema-registry.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< date: Thu, 02 Jul 2020 15:17:23 GMT
+< expires: Wed, 01 Jul 2020 15:17:23 GMT
+< pragma: no-cache
+< cache-control: no-cache, no-store, must-revalidate
+< content-type: application/json
+< content-length: 234
+< set-cookie: 48d464614e9c55eed8a855d7c4a0b1a8=1c3998ecfac5dec86e81f20dbc5384da; path=/; HttpOnly
+< 
+{ [234 bytes data]
+100   234  100   234    0     0   2017      0 --:--:-- --:--:-- --:--:--  2034
+* Connection #0 to host apicurio-registry.user1-schema-registry.apps.cluster-03b3.03b3.example.opentlc.com left intact
+{
+  "name": "IncidentReportedEvent",
+  "description": "Schema for IncidentReportedEvent message.",
+  "createdOn": 1593701733884,
+  "modifiedOn": 1593701733884,
+  "id": "IncidentReportedEvent",
+  "version": 2,
+  "type": "JSON",
+  "globalId": 327695,
+  "state": "ENABLED"
+}
+----
+
+== Tear down the test environment
+
+In order to free up resources on the OpenShift cluster, you can tear down the environment you deployed in the first step of the lab. 
+
+To do so, execute the following Ansible commands:
+
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_producer_app.yml -e project_admin=user1 -e project_name=schema-registry -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_consumer_app.yml -e project_admin=user1 -e project_name=schema-registry -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/apicurio-registry.yml -e project_admin=user1 -e project_name=schema-registry -e namespace_tools=user1-schema-registry -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/incident_service.yml -e project_admin=user1 -e project_name=schema-registry -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/postgresql.yml -e project_admin=user1 -e project_name=schema-registry -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=schema-registry -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=schema-registry -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=schema-registry -e ACTION=uninstall
+----

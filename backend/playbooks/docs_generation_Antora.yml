@@ -1,0 +1,71 @@
+- hosts: localhost
+  connection: local
+  vars:
+    base_path: ../../
+    build_images_path: ../../build/site/content/1/_images/
+    source: pages
+    root: modules/ROOT
+    destination: build
+    git_msg: "Generated content"
+    path_tmp: tmp
+  vars_prompt:
+    - name: indexName
+      prompt: What is your main file name (index.adoc)? Provide only the name. Ex. 01_1_Environment_Setup_Lab.adoc
+      private: no
+    - name: updateRepo
+      prompt: Do you need to download your repo? Y/N
+      private: no
+    - name: path_origin
+      prompt: Provide your content repository URL.Ex. https://github.com/redhat-gpe/example
+      private: no 
+  
+  tasks:
+  
+  - name: Download source code from repo
+    shell: (mkdir "{{ path_tmp }}";git clone "{{ path_origin }}" "{{ path_tmp }}"; mv temp/.git code/.git)
+    register: download
+    failed_when: download.rc == "already exists and is not an empty directory" not in download.rc
+    when: "{{ updateRepo == 'Y' }}"
+
+  - name: moving lab docs
+    shell: (find . "{{ path_tmp }}" -type f \( -iname \*_Lab.adoc  \) -exec cp -P {} "{{ base_path }}{{ root }}/pages/" \;) 
+    when: "{{ updateRepo == 'Y' }}"
+  
+  - name: Create index.adoc
+    shell:  (find "{{ base_path }}{{ root }}/pages" -name "{{ indexName }}" -exec mv {} "{{ base_path }}{{ root }}/pages/index.adoc" \;)
+
+  - name: Move images to content folder
+    shell: (find . "{{ base_path }}{{ root }}"/pages/ -type f \( -iname \*.jpg -o -iname \*.png \) -exec cp -P {} "{{ base_path }}{{ root }}"/images \;) 
+    register: images
+  - debug: msg="{{ images.rc }}"
+    when: "{{ updateRepo == 'Y' }}"
+
+  - name: Move image folder
+    shell: (rm -rf ../../build/site/content/1/_images/images/; mkdir ../../build/site/content/1/_images/images/; mv ../../build/site/content/1/_images/*.png ../../build/site/content/1/_images/images/)  
+    register: move
+    failed_when: move.rc == "File exists" not in move.rc
+    when: "{{ updateRepo == 'Y' }}"
+
+  - name: create nav adoc file
+    shell:  (sh nav.sh)
+
+  - name: Env variables substitution
+    ansible.builtin.replace:
+      path: "{{ base_path }}{{ root }}/{{ source }}/index.adoc"
+      regexp: '%guid%'
+      replace: "{{ lookup('env', 'guid') }}" 
+    register: replace
+  - debug: msg="{{ replace }}"
+
+  - name: Updating content in the repository (Antora)
+    shell: (rootPath=`pwd`;git add $rootPath/../../"{{ root }}"; git commit -m "{{ git_msg }}"; git push)
+
+  - name: Run Antora for adoc files
+    shell: (cd ../.. ;antora --fetch antora-playbook.yml)
+    register: doc
+  - debug: msg="{{ doc.stdout }}"
+
+  - name: Cleaning after finishing
+    shell: (rm -rf "{{ path_tmp }}")
+
+

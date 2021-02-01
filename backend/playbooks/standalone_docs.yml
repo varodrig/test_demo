@@ -1,0 +1,81 @@
+- hosts: localhost
+  connection: local
+  vars_files:
+    - ../input/input.yml
+  vars_prompt:
+  - name: username
+    prompt: What is your Quay's username?
+    private: no
+  - name: password
+    prompt: What is your Quay's password?
+  - name: organization
+    prompt: organization/user in Quay?
+    private: no
+  vars:
+    image_registry_path: "quay.io/{{ organization }}/containers-lab:latest"
+    image_tag: latest
+    container_name: "docs"
+  tasks:
+  - debug:
+      msg: 'Username: {{ username }}'
+  - name: input_list
+    ansible.builtin.debug:
+      msg: "{{ item }}"
+    with_items: "{{ assets }}"
+  - name: input_list -> loop
+    ansible.builtin.debug:
+      msg: "{{ assets[1].method }}"
+    loop:
+      -  "{{ assets[1]}}"
+      
+  - name: docker login
+    community.docker.docker_login:
+      registry: quay.io
+      username: "{{ username }}" 
+      password: "{{ password }}"
+      config_path: /tmp/.mydockercfg
+
+  - name: copy Dockerfile
+    copy:
+      src: "{{ assets[1].dockerFile }}"
+      dest: "{{ assets[1].source }}"
+
+  - name: Get infos on container
+    community.docker.docker_container_info:
+      name: "{{ container_name }}"
+    register: result
+
+  - name: Does container exist?
+    ansible.builtin.debug:
+      msg: "The container {{ 'exists' if result.exists else 'does not exist' }}"
+
+  - name: Stop the container if exists before creation
+    community.general.docker_container:
+      name: "{{ container_name }}"
+      state: absent
+      force_kill: yes
+    when: "{{ result.exists }}"
+
+  - name: Remove image
+    shell: (docker image rm "{{ image_registry_path }}")
+    register: remove
+    failed_when: remove.rc == "No such" not in remove.stdout
+  - debug: msg="{{ remove.stdout }}"
+
+  - name: Build the content image
+    community.general.docker_image:
+      build: 
+       path: "{{ assets[1].source }}"
+      name: "{{ image_registry_path }}"
+      tag: latest
+      push: yes
+      source: build
+    when: "{{ assets[1].method == 'source' }}"
+
+  - name: Create the content container
+    community.general.docker_container:
+      name: docs
+      image: "{{ image_registry_path }}"
+      pull: yes
+      ports:
+       - "{{ assets[1].ports[0] }}"
