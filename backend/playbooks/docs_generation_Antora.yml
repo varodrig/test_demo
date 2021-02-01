@@ -27,6 +27,12 @@
     failed_when: download.rc == "already exists and is not an empty directory" not in download.rc
     when: "{{ updateRepo == 'Y' }}"
 
+  - name: Create root folders if needed.
+    shell: (mkdir "{{ base_path }}{{ root }}/pages")
+    register: create
+    failed_when: create.rc == "already exists" not in create.rc
+    when: "{{ updateRepo == 'Y' }}"
+
   - name: moving lab docs
     shell: (find . "{{ path_tmp }}" -type f \( -iname \*_Lab.adoc  \) -exec cp -P {} "{{ base_path }}{{ root }}/pages/" \;) 
     when: "{{ updateRepo == 'Y' }}"
