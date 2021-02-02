@@ -1,0 +1,901 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== Securing Applications Lab
+
+.Prerequisites
+* Access to a Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6.x
+
+.Goals
+* Secure access to Quarkus applications with Red Hat SSO using OpenId Connect and JWT Tokens  
+* Externalize security policy checks with Red Hat SSO Authorization Services 
+
+:numbered:
+
+== Introduction
+
+Security is a very broad and complex topic which covers all layers of an IT landscape from hardware over Operating System and networks to application code. In the scope of this module we concentrate on application level security, more in particular authentication and authorization.
+
+In this regards a distinction can be made between transport security and origin security.
+
+Transport security has to do with securing the communication between applications in a distributed system, including encryption. This involves techniques like TLS and mutual TLS, where client and servers identify themselves using certificates. While these concerns can be handled by the applications themselves, setting up the infrastructure and handling things like certificates is rather complex, so it is better delegated to the infrastructure itself, if possible. On OpenShift, this is where Service Mesh comes in the picture. One of the big selling points of Service Mesh is that it can handle transport security between distributed applications in a very transparent way.
+
+Origin security is all about users and systems accessing applications, and determining what they are allowed to do in the application. The user or system wanting to access a secured application resource needs to present valid credentials (e.g. in the form of a token) as proof of his or its identity. The application verifies the credentials (authentication) and determines whether the resource is authorized for the user/system based on e.g. roles (Role Based Access Control).
+
+OpenID Connect (https://openid.net/connect) and JSON Web Tokens (https://jwt.io/) are rapidly becoming the de-facto standard for origin security for cloud-native distributed applications.
+
+Red Hat SSO is an Identity and Access Management system with full support for OpenID Connect and JWT. In this lab you will secure a couple of Quarkus applications using OpenID Connect and JWT, and with Red Hat SSO as Authentication and Authorization server.
+
+== Deploy a Development Environment
+
+In a previous lab you developed the incident aggregation service, using Kafka Streams. In this lab you add the incident finder service to the Emergency Response application. The incident finder service allows to lookup incidents by the name of the incident reporter, and display aggregated information about the matching incidents. The incident finder service calls the incident service to get a list of incidents for a given name, and then calls the incident aggregation service to get information about each of these incidents.
+
+In this lab, you will secure both the incident finder as the incident aggregation service using OpenID Connect. 
+
+Start by deploying the incident aggregation service and the incident finder service in their own namespace.
+
+[NOTE]
+====
+The instructions go from the assumption that you deployed the Emergency Response application in the `user1-er-demo` namespace. If your namespace is different you have to adjust the instructions.
+====
+
+. Make sure you are logged in the OpenShift cluster as a user with admin privileges.
+. Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file:
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+
+. Deploy the incident aggregation service:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/incident_aggregation_service.yml -e project_admin=user1 -e project_name=security -e namespace_kafka_cluster=user1-er-demo -e disaster_service_url=http://disaster-service.user1-er-demo.svc:8080 -e kafka_streams_application_id=incident-aggregation-security
+----
++
+The playbook deploys the incident aggregation service in the `user1-security` namespace. The service points to the Kafka cluster and the disaster service of the Emergency Response demo in the `user1-er-demo` namespace.
+
+. Test the service aggregation service. 
+* Find the ID of an existing incident. One way to do so is by exposing the incident service of the Emergency Response demo through a route, and call the REST API of the incident service to obtain a list of incidents.
++
+----
+$ oc expose service incident-service -n user1-er-demo
+$ INCIDENT_SERVICE_URL=http://$(oc get route incident-service -n user1-er-demo --template='{{ .spec.host }}')
+$ curl -v -X GET ${INCIDENT_SERVICE_URL}/incidents
+----
++
+If the `curl` command returns an empty array, run a simulation on the Emergency Response application, and try again.
+* Choose an incident ID from the incidents returned from the incident service.
+* Call the incident aggregation service with the incident ID:
++
+----
+$ INCIDENT_AGGREGATION_SERVICE_URL=https://$(oc get route incident-aggregation-service -n user1-security --template='{{ .spec.host }}')
+$ curl -v ${INCIDENT_AGGREGATION_SERVICE_URL}/incident/<incident id>
+----
++
+.Sample Output
+----
+*   Trying 18.158.125.5:443...
+* Connected to incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com (18.158.125.5) port 443 (#0)
+* ALPN, offering h2
+* ALPN, offering http/1.1
+* successfully set certificate verify locations:
+*   CAfile: /etc/pki/tls/certs/ca-bundle.crt
+  CApath: none
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+* TLSv1.2 (IN), TLS handshake, Certificate (11):
+* TLSv1.2 (IN), TLS handshake, Server key exchange (12):
+* TLSv1.2 (IN), TLS handshake, Server finished (14):
+* TLSv1.2 (OUT), TLS handshake, Client key exchange (16):
+* TLSv1.2 (OUT), TLS change cipher, Change cipher spec (1):
+* TLSv1.2 (OUT), TLS handshake, Finished (20):
+* TLSv1.2 (IN), TLS handshake, Finished (20):
+* SSL connection using TLSv1.2 / ECDHE-RSA-AES128-GCM-SHA256
+* ALPN, server did not agree to a protocol
+* Server certificate:
+*  subject: CN=api.cluster-03b3.03b3.example.opentlc.com
+*  start date: Jun 16 06:03:05 2020 GMT
+*  expire date: Sep 14 06:03:05 2020 GMT
+*  subjectAltName: host "incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com" matched cert's "*.apps.cluster-03b3.03b3.example.opentlc.com"
+*  issuer: C=US; O=Let's Encrypt; CN=Let's Encrypt Authority X3
+*  SSL certificate verify ok.
+> GET /incident/5e641363-831a-411d-898e-db615d9367e0 HTTP/1.1
+> Host: incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< content-length: 388
+< content-type: application/json
+< set-cookie: 474696dd8b7afc576361cdde6e68ae17=83202973487e315a932364e7ccb01b01; path=/; HttpOnly; Secure
+< cache-control: private
+< 
+* Connection #0 to host incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com left intact
+{"id":"5e641363-831a-411d-898e-db615d9367e0","lat":34.10773,"lon":-77.90577,"numberOfPeople":5,"medicalNeeded":false,"timestamp":1595882422283,"victimName":"Scarlett Anderson","victimPhoneNumber":"(252) 555-1238","status":"RESCUED","currentPositionLat":34.0581,"currentPositionLon":-77.8885,"destinationLat":34.0583,"destinationLon":-77.8885,"destinationName":"Carolina Beach Yacht Club"}
+----
+
+. Deploy the incident finder service:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/incident_finder_service.yml -e project_admin=user1 -e project_name=security -e incident_service_url=incident-service.user1-er-demo.svc
+----
+
+. Test the incident finder service. The service has an simplistic UI which allows to search for incidents by name.
+* Obtain the URL to the incident finder service:
++
+----
+$ INCIDENT_FINDER_SERVICE_URL=https://$(oc get route incident-finder-service -n user1-security --template='{{ .spec.host }}')
+$ echo $INCIDENT_FINDER_SERVICE_URL
+----
+* In a browser window, navigate to the URL of the incident finder service. Expect to see the home page of the application:
++
+image::images/incident-finder-service.png[]
+* Pick a name from the list of incidents you retrieved earlier. Enter the name - or a part of it - in the search box of the application. Click _Search_. Expect to see a JSON output in the results box:
++
+image::images/incident-finder-service-2.png[]
+
+== Secure Quarkus applications with OpenID Connect and Red Hat SSO
+
+=== Create a Realm in Red Hat SSO
+
+As part of the installation of the Emergency Response application, an instance of Red Hat SSO is deployed, and configured with a realm for the application. In this lab, you create a second realm for the incident finder application.
+
+. Obtain the URL for the SSO server:
++
+----
+$ SSO_URL=$(oc get route sso -n er-sso --template='{{ .spec.host }}')
+$ echo https://${SSO_URL}
+----
+
+. Get the SSO admin username and password:
++
+----
+$ echo $(oc get secret credential-rhsso -n er-sso --template='{{ .data.ADMIN_USERNAME }}' | base64 -d)
+$ echo $(oc get secret credential-rhsso -n er-sso --template='{{ .data.ADMIN_PASSWORD }}' | base64 -d)
+----
+
+. In a browser window, navigate to the Red Hat SSO URL. Expect to see the welcome page of the SSO server. Click on _Administration Console_ to navigate to the login page of the SSP administration console. Enter the admin username and password. Expect to see the _Realm Overview_ page:
++
+image::images/sso-realm-overview.png[]
+
+. Click on the _Select Realm_ dropdown link on the left, and click the _Add Realm_ button:
++
+image::images/sso-add-realm.png[]
+
+. In the _Add Realm_ page, enter `emergency-response-external` as name for the realm. Make sure that _Enabled_ is set to `ON`, and click _Create_ to create the realm.
++
+image::images/sso-create-realm.png[]
+
+. In the _Realm Settings_ pane, navigate to the _Login_ tab. Set the _User registration_ slider to `ON`. Make sure that _Require SSL_ is set to `external requests`. Click _Save_.
++
+image::images/sso-allow-user-registration.png[]
+
+. Click on _Clients_ in the left menu to open the realm client overview page. Click on the _Create_ on the right to create a new client for the incident finder service.
++
+image::images/sso-realm-clients.png[]
+
+. In the _Add Client_ page, enter `incident-finder` in the _Client ID_ field. Leave the _Client Protocol_ to `openid-connect`. Click _Save_.
++
+image::images/sso-add-client.png[]
+
+. In the _Settings_ tab of the new client, set the following:
+* _Standard Flow Enabled_: `ON`
+* _Implicit Flow Enabled_: `OFF`
+* _Access Type_: `public`
+* _Direct Access Grant Enabled_: `ON`
++
+This setting allows you to obtain a token with a username/password combination.
+* _Valid Redirect URIs_: set this to `${INCIDENT_FINDER_URL}/*`. Substitute `${INCIDENT_FINDER_URL}` with the value of the external URL for the incident finder service.
+* Leave other values as is.
++
+image::images/sso-client-settings.png[]
++
+Click _Save_ on the bottom of the screen to save the settings.
+
+. Add another client for the incident aggregation service. The incident aggregation service is not a web application, but rather a service. This means that access will be only be granted if the user is already authenticated and a valid token is presented  as part of the request, in the HTTP _Authorization_ header. 
+* Create a new client in the `emergency-response-external` realm. 
+* Name the client `incident-aggregation`.
+* In the _Settings_ tab of the client, set the _Access type_ to `bearer-only`.
++
+image::images/sso-client-bearer-only.png[]
+
+With the realm and the two clients in place, you can proceed to securing the applications.
+
+=== Secure the Incident Finder Application.
+
+The Quarkus OpenID Connect extension allows to secure applications where authentication and authorization are based on tokens issued by OpenId Connect and OAuth 2.0 compliant Authorization Servers such as Red Hat SSO.
+
+The extension allows you to easily enable authentication to your web application based on the Authorization Code Flow so that your users are redirected to a OpenID Connect Provider (e.g.: Red Hat SSO) to authenticate and, once the authentication is complete, return back to your application.
+
+. Check out the source code of the incident finder service from the course repository on GitHub:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/incident-finder-service.git
+$ cd incident-finder-service
+----
+. Import the code into your IDE of choice.
+. Ensure the code builds successfully:
++
+----
+$ mvn clean package
+----
+. Familiarize yourself with the code. The incident finder service is implemented using Quarkus. Some classes of interest include:
+* `search.html`: the search page for the application.
+* `IncidentResource`: the implementation of the REST endpoint called by the search page. It uses a reactive programming style using the Mutiny reactive library. Refer to https://quarkus.io/guides/getting-started-reactive for an introduction into reactive with Quarkus. +
+The implementation calls out to `IncidentService` to fetch a list of incidents for a given name, loops through the list and calls the `IncidentAggregationService` for every element of the list.
+* `IncidentService`: uses the Vert.x web client to call the incident service.
+* `IncidentAggregationService`: uses the Vert.x web client to call the incident aggregation service.  
+
+. Add a dependency to the Quarkus OpenID Connect extension in the `pom.xml` file of the project. 
++
+----
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-oidc</artifactId>
+    </dependency>
+----
+
+. Add the following configuration to the `src/main/resources/application.properties` file:
++
+----
+quarkus.oidc.application-type=web-app
+quarkus.oidc.authentication.force-redirect-https-scheme=true
+quarkus.oidc.authentication.remove-redirect-parameters=true
+quarkus.http.auth.permission.permit.paths=/health/*
+quarkus.http.auth.permission.permit.policy=permit
+quarkus.http.auth.permission.authenticated.paths=/*
+quarkus.http.auth.permission.authenticated.policy=authenticated
+----
++
+* `quarkus.oidc.application-type`: the type of application. Allowed values are `web-app` and `service`. `web-app` should be used for web applications with a UI component, `service` for applications that expose a REST API.
+* `quarkus.oidc.authentication.force-redirect-https-scheme`: Force 'https' as the 'redirect_uri' parameter scheme when running behind an SSL terminating reverse proxy. This is the case here, as the incident finder service is deployed with an edge terminated route.
+* `quarkus.oidc.authentication.remove-redirect-parameters`: Remove the query parameters such as 'code' and 'state' set by the Authentication Server on the redirect URI after the user has authenticated by redirecting a user to the same URI but without the query parameters.
+* `quarkus.http.auth.permission.*`: defines which resources are authorized and which are freely accessible. In our case, `/health`, which is the endpoint used by the application's health check is allowed for unauthenticated users. All other paths require an authenticated user. There are three built-in policies: `deny`, `permit` and authenticated.
+
+. That's it. No code changes are required. Before deploying the secured version of the application to OpenShift, you need to add some runtime configuration settings to the application configmap. +
+Edit the `incident-finder-service` configmap in the `user1-security` namespace:
++
+----
+$ oc edit configmap incident-finder-service -n user1-security
+----
++
+Add the following configuration settings:
++
+----
+quarkus.oidc.auth-server-url=https://${SSO_URL}/auth/realms/emergency-response-external
+quarkus.oidc.client-id=incident-finder
+----
++
+Substitute `${SSO_URL}` with the external URL to the SSO server.
+
+. Build the application, create an image and push the image to OpenShift.
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-security/incident-finder-service:secure .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-security/incident-finder-service:secure
+----
+
+. Patch the incident finder service deploymentconfig to point to the new image. This will force a redeployment of the incident finder application. 
++
+----
+$ oc patch dc incident-finder-service --type='json' -p '[{"op": "replace", "path": "/spec/triggers/1/imageChangeParams/from/name", "value": "incident-finder-service:secure"}]' -n user1-security
+----
+
+. Open a browser window, and navigate to the URL of the incident finder service. Expect to be redirected to the realm login page on the SSO server.
++
+image::images/realm-login-screen.png[]
++
+If you still have a browser window with the incident finder application, you will have to close that first. Alternatively, open the application in an _incognito_ browser session.
+
+. Click on the _Register_ link to register as new user. Fill in the form, and click _Register_
++
+image::images/realm-register.png[]
+
+. Expect to be redirected to the application home page. Check that the application is working as expected.
+
+. Verify that the `/health` endpoint is still accessible without authentication. In a terminal window, execute the following `curl` command:
++
+----
+$ INCIDENT_FINDER_SERVICE_URL=https://$(oc get route incident-finder-service -n user1-security --template='{{ .spec.host }}')
+$ curl -v -X GET ${INCIDENT_FINDER_SERVICE_URL}/health
+----
++
+.Sample Output
+----
+*   Trying 18.158.125.5:443...
+* Connected to incident-finder-user1-security.apps.cluster-03b3.03b3.example.opentlc.com (18.158.125.5) port 443 (#0)
+* ALPN, offering h2
+* ALPN, offering http/1.1
+* successfully set certificate verify locations:
+*   CAfile: /etc/pki/tls/certs/ca-bundle.crt
+  CApath: none
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+* TLSv1.2 (IN), TLS handshake, Certificate (11):
+* TLSv1.2 (IN), TLS handshake, Server key exchange (12):
+* TLSv1.2 (IN), TLS handshake, Server finished (14):
+* TLSv1.2 (OUT), TLS handshake, Client key exchange (16):
+* TLSv1.2 (OUT), TLS change cipher, Change cipher spec (1):
+* TLSv1.2 (OUT), TLS handshake, Finished (20):
+* TLSv1.2 (IN), TLS handshake, Finished (20):
+* SSL connection using TLSv1.2 / ECDHE-RSA-AES128-GCM-SHA256
+* ALPN, server did not agree to a protocol
+* Server certificate:
+*  subject: CN=api.cluster-03b3.03b3.example.opentlc.com
+*  start date: Jun 16 06:03:05 2020 GMT
+*  expire date: Sep 14 06:03:05 2020 GMT
+*  subjectAltName: host "incident-finder-user2-security.apps.cluster-03b3.03b3.example.opentlc.com" matched cert's "*.apps.cluster-03b3.03b3.example.opentlc.com"
+*  issuer: C=US; O=Let's Encrypt; CN=Let's Encrypt Authority X3
+*  SSL certificate verify ok.
+> GET /health HTTP/1.1
+> Host: incident-finder-user2-security.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< content-type: application/json; charset=UTF-8
+< content-length: 46
+< set-cookie: 44957506a1a740cb375e21e23e7a7c01=cf51d4002e0879d798885c53c8bf6cb2; path=/; HttpOnly; Secure
+< cache-control: private
+< 
+
+{
+    "status": "UP",
+    "checks": [
+    ]
+* Connection #0 to host incident-finder-user1-security.apps.cluster-03b3.03b3.example.opentlc.com left intact
+}
+----
++
+The response to a `curl` command to the `/search` endpoint on the other hand is a HTTP 302 redirect to the SSO server:
++
+----
+Note: Unnecessary use of -X or --request, GET is already inferred.
+*   Trying 18.194.125.175:443...
+* Connected to incident-finder-user2-security.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 443 (#0)
+[...]
+> GET /search HTTP/1.1
+> Host: incident-finder-user2-security.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 302 Found
+< location: https://sso-er-sso.apps.cluster-03b3.03b3.example.opentlc.com/auth/realms/emergency-response-external-2/protocol/openid-connect/auth?redirect_uri=https%3A%2F%2Fincident-finder-user2-security.apps.cluster-03b3.03b3.example.opentlc.com%2Fsearch&state=8132457f-63bc-41cc-9b91-04eaf26dea73&scope=openid&response_type=code&client_id=incident-finder
+< content-length: 0
+< set-cookie: q_auth=8132457f-63bc-41cc-9b91-04eaf26dea73; Max-Age=1800; Expires=Wed, 29 Jul 2020 20:33:29 GMT; HTTPOnly
+< set-cookie: 44957506a1a740cb375e21e23e7a7c01=cf51d4002e0879d798885c53c8bf6cb2; path=/; HttpOnly; Secure
+< 
+* Connection #0 to host incident-finder-user1-security.apps.cluster-03b3.03b3.example.opentlc.com left intact
+----
+
+. (Optional). In the application code you can get access to the authenticated identity information by injecting a SecurityIdentity instance.
+* In the `IncidentResource` class, add the following code:
++
+----
+    @Inject
+    SecurityIdentity securityIdentity;
+
+    @GET
+    @Path("/incidents")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Uni<Response> getIncidents(@QueryParam("name") String name) {
+        log.info("Principal: " + securityIdentity.getPrincipal().getName());
+        return incidentService.incidentsByName(name)
+                [...]
+    }
+----
+* Build the code, build an image and push to OpenShift
++
+[TIP]
+====
+Every time you build the application with Maven, the list of dependencies in the `target/lib` is created again. When building the image, the `target/lib` folder is copied to the image as a new layer, which has to be pushed to the registry. To avoid this you can do the following to reuse the `target/lib` folder:
+
+----
+$ mv target/lib /tmp/
+$ mvn package
+$ rm -rf target/lib/ && mv /tmp/lib/ target/
+$ podman build ...
+----
+
+By doing so only the image layer with the application jar needs to be copied to the remote registry. Of course, you can only do this if you are sure that the list of application dependencies did not change since your last build.
+====
+
+. Test the application again. Check the logs of the incident finder service pod. Expect to see the log statements with the name of the authenticated principal:
++
+----
+2020-07-29 20:24:55,800 INFO  [io.quarkus] (main) incident-finder-service 1.0.0-SNAPSHOT on JVM (powered by Quarkus 1.5.2.Final) started in 12.696s. Listening on: http://0.0.0.0:8080
+2020-07-29 20:24:55,802 INFO  [io.quarkus] (main) Profile prod activated. 
+2020-07-29 20:24:55,802 INFO  [io.quarkus] (main) Installed features: [cdi, mutiny, oidc, resteasy, resteasy-mutiny, security, smallrye-health, vertx]
+2020-07-29 20:25:22,893 INFO  [com.red.eme.res.inc.fin.IncidentResource] (executor-thread-1) Principal: btison
+2020-07-29 20:26:08,851 INFO  [com.red.eme.res.inc.fin.IncidentResource] (executor-thread-1) Principal: btison
+----
+
+=== Secure the Incident Aggregation Service
+
+The steps to secure the incident aggregation service are quite analogous to the ones you did for the incident finder application.
+
+. Check out the source code of the incident aggregation service from the course repository on github:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/incident-aggregation-security.git
+$ cd incident-aggregation-security
+----
+. Import the code into your IDE of choice.
+. Ensure the code builds successfully:
++
+----
+$ mvn clean package
+----
+
+. Add a dependency to the Quarkus OpenID Connect extension in the `pom.xml` file of the project. 
++
+----
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-oidc</artifactId>
+    </dependency>
+----
+
+. Add the following configuration to the `src/main/resources/application.properties` file:
++
+----
+quarkus.oidc.application-type=service
+----
+
+. When securing the REST API of a Quarkus application, there are two possibilities: using configuration or using annotations in source code. +
+Using configuration would be very similar to what you did for the incident finder application, with `quarkus.http.auth.permission.*` configuration settings. +
+To secure the REST endpoint of the application, add the `@Authenticated` annotation to the `getIncident` method of the `IncidentResource` class.  
++
+----
+    @GET
+    @Path("/incident/{id}")
+    @Authenticated
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response getIncident(@PathParam("id") String id) {
+        [....]
+    }
+----
++
+With the annotation in place, the REST endpoint is only authorized for authenticated users. Authentication happens by passing in a valid JSON Web Token as HTTP Authorization header on the request.
+
+. The `getIncident` method contains code to delegate the call to a peer of the current service in case a particular incident ID is not managed by the current node (refer to the _Kafka Streams_ lab for more details). +
+Now that the REST endpoint is secured, the JSON Web token needs to be propagated to the peer service. +
+The Quarkus OIDC extension allows to inject the JSON Web Token into a CDI bean.
+* Inject the JSON Web Token instance in the `IncidentResource` class.
++
+----
+    @Inject
+    JsonWebToken jsonWebToken;
+----
+* Modify the code that calls the peer service to include the JSON Web token as a header. The Vert.x web client has a convenience method for this. Change the code as follows:
++
+----
+            WebClient client = WebClient.create(vertx);
+            CompletableFuture<Pair<Incident, Integer>> future = new CompletableFuture<>();
+            client.get(8080, incident.getRight(), "/incident/" + id)
+                    .bearerTokenAuthentication(jsonWebToken.getRawToken()).send(ar -> {
+                [...]
+            });           
+----
+
+. Before deploying the secured version of the service to OpenShift, you need to add some runtime configuration settings to the application configmap. +
+Edit the `incident-aggregation-service` configmap in the `user1-security` namespace:
++
+----
+$ oc edit configmap incident-aggregation-service -n user1-security
+----
++
+Add the following configuration settings:
++
+----
+quarkus.oidc.auth-server-url=https://${SSO_URL}/auth/realms/emergency-response-external
+quarkus.oidc.client-id=incident-aggregation
+----
++
+Substitute `${SSO_URL}` with the external URL to the SSO server.
+
+. Build the application, create an image and push the image to OpenShift.
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-security/incident-aggregation-service:secure .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-security/incident-aggregation-service:secure
+----
+
+. Patch the incident aggregation service deploymentconfig to point to the new image. This will force a redeployment of the incident aggregation service. 
++
+----
+$ oc patch dc incident-aggregation-service --type='json' -p '[{"op": "replace", "path": "/spec/triggers/1/imageChangeParams/from/name", "value": "incident-aggregation-service:secure"}]' -n user1-security
+----
+
+. Test the service aggregation service. Choose an existing incident ID. Expect a `401 Unauthorized` HTTP return code. 
++
+----
+$ INCIDENT_AGGREGATION_SERVICE_URL=https://$(oc get route incident-aggregation-service -n user1-security --template='{{ .spec.host }}')
+$ curl -v ${INCIDENT_AGGREGATION_SERVICE_URL}/incident/<incident id>
+----
++
+.Sample Output
+----
+*   Trying 18.158.125.5:443...
+* Connected to incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com (18.158.125.5) port 443 (#0)
+* ALPN, offering h2
+* ALPN, offering http/1.1
+* successfully set certificate verify locations:
+*   CAfile: /etc/pki/tls/certs/ca-bundle.crt
+  CApath: none
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+* TLSv1.2 (IN), TLS handshake, Certificate (11):
+* TLSv1.2 (IN), TLS handshake, Server key exchange (12):
+* TLSv1.2 (IN), TLS handshake, Server finished (14):
+* TLSv1.2 (OUT), TLS handshake, Client key exchange (16):
+* TLSv1.2 (OUT), TLS change cipher, Change cipher spec (1):
+* TLSv1.2 (OUT), TLS handshake, Finished (20):
+* TLSv1.2 (IN), TLS handshake, Finished (20):
+* SSL connection using TLSv1.2 / ECDHE-RSA-AES128-GCM-SHA256
+* ALPN, server did not agree to a protocol
+* Server certificate:
+*  subject: CN=api.cluster-03b3.03b3.example.opentlc.com
+*  start date: Jun 16 06:03:05 2020 GMT
+*  expire date: Sep 14 06:03:05 2020 GMT
+*  subjectAltName: host "incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com" matched cert's "*.apps.cluster-03b3.03b3.example.opentlc.com"
+*  issuer: C=US; O=Let's Encrypt; CN=Let's Encrypt Authority X3
+*  SSL certificate verify ok.
+> GET /incident/b0112795-a005-4d37-8d0e-eaeeb6fcb533 HTTP/1.1
+> Host: incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 401 Unauthorized
+< content-length: 0
+< set-cookie: 474696dd8b7afc576361cdde6e68ae17=be8d6ecfbce23713204420477da7e3f6; path=/; HttpOnly; Secure
+< 
+* Connection #0 to host incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com left intact
+----
+
+. Obtain an access token from the SSO server. Replace `<username>` and `<password>` with the username and password you chose when registering for the incident finder service. Use the `incident-finder` client ID. This client has been configured to allow direct access grants.
++
+----
+$ TKN=$(curl -X POST "https://${SSO_URL}/auth/realms/emergency-response-external/protocol/openid-connect/token" \
+ -H "Content-Type: application/x-www-form-urlencoded" \
+ -d "username=<username>" \
+ -d "password=<password>" \
+ -d "grant_type=password" \
+ -d "client_id=incident-finder" \
+ | sed 's/.*access_token":"//g' | sed 's/".*//g')
+$ echo $TKN
+----
++
+.Sample output
+----
+eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICItOUE4OXJkcGlENlNZLXNBVHZULWtETmtEU28wSkRDTm4xd2ppbkU4OUM0In0.eyJqdGkiOiIxYTQyYWNiNC1hYzNlLTQwYzgtODg3Yy02Y2E5NzVkOTIzMDEiLCJleHAiOjE1OTYwOTI2NjYsIm5iZiI6MCwiaWF0IjoxNTk2MDkyMzY2LCJpc3MiOiJodHRwczovL3Nzby11c2VyLXNzby5hcHBzLmNsdXN0ZXItMDNiMy4wM2IzLmV4YW1wbGUub3BlbnRsYy5jb20vYXV0aC9yZWFsbXMvZW1lcmdlbmN5LXJlc3BvbnNlLWV4dGVybmFsLTIiLCJhdWQiOiJhY2NvdW50Iiwic3ViIjoiN2RhZmE5MmMtMjhhZi00MTgwLWI3YzMtZDJjYzQwYTI4NDA4IiwidHlwIjoiQmVhcmVyIiwiYXpwIjoiaW5jaWRlbnQtZmluZGVyIiwiYXV0aF90aW1lIjowLCJzZXNzaW9uX3N0YXRlIjoiZTY5OGVkODEtNjBmYS00ZDg0LWI5MjQtYjc1ODFkY2RlZmUxIiwiYWNyIjoiMSIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJvZmZsaW5lX2FjY2VzcyIsInVtYV9hdXRob3JpemF0aW9uIl19LCJyZXNvdXJjZV9hY2Nlc3MiOnsiYWNjb3VudCI6eyJyb2xlcyI6WyJtYW5hZ2UtYWNjb3VudCIsIm1hbmFnZS1hY2NvdW50LWxpbmtzIiwidmlldy1wcm9maWxlIl19fSwic2NvcGUiOiJwcm9maWxlIGVtYWlsIiwiZW1haWxfdmVyaWZpZWQiOmZhbHNlLCJuYW1lIjoiQmVybmFyZCBUaXNvbiIsInByZWZlcnJlZF91c2VybmFtZSI6ImJ0aXNvbiIsImdpdmVuX25hbWUiOiJCZXJuYXJkIiwiZmFtaWx5X25hbWUiOiJUaXNvbiIsImVtYWlsIjoiYnRpc29uQHJlZGhhdC5jb20ifQ.TQXGcrrstVXZgkqYSyvI8Xc0b50yyjLYN3H1FiC8Z-gxlaWSbuDaavi7EoTQl0TRjRXheaHUqr79qBFBWcteNBEP0PxejIHF6V3Rf-6DDHqsJ8kTVrsVEFrCTWb38xc8DBA2UEWxFS3FW_d4D8YraZDwR1z5PvYZp5uH7qNu24pbT1im0Z9nTsEIyYHqlF6zhk_FQvlqpJ1zfuV48TEY92EeXgFFL6W4o6FQcCJZbmwuNHq_PWCQb9zRse1FAiYvz5ZxRf__CkeV5MmK9x17jZm034NreizHNjWVvZMKe_0b5WjOOl3P94mV1wEsHEXfaXg3FN9X4vBK6KG5IzJFNQ
+----
+
+. Call the incident aggregation application again, but this time add an HTTP Authorization header with the token. You should be able to successfully access the application now.
++
+----
+$ curl -v -H "Authorization: Bearer ${TKN}" ${INCIDENT_AGGREGATION_SERVICE_URL}/incident/<incident id>
+----
++
+.Sample Output
+----
+*   Trying 18.194.125.175:443...
+* Connected to incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 443 (#0)
+* ALPN, offering h2
+* ALPN, offering http/1.1
+* successfully set certificate verify locations:
+*   CAfile: /etc/pki/tls/certs/ca-bundle.crt
+  CApath: none
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+* TLSv1.2 (IN), TLS handshake, Certificate (11):
+* TLSv1.2 (IN), TLS handshake, Server key exchange (12):
+* TLSv1.2 (IN), TLS handshake, Server finished (14):
+* TLSv1.2 (OUT), TLS handshake, Client key exchange (16):
+* TLSv1.2 (OUT), TLS change cipher, Change cipher spec (1):
+* TLSv1.2 (OUT), TLS handshake, Finished (20):
+* TLSv1.2 (IN), TLS handshake, Finished (20):
+* SSL connection using TLSv1.2 / ECDHE-RSA-AES128-GCM-SHA256
+* ALPN, server did not agree to a protocol 
+* Server certificate:
+*  subject: CN=api.cluster-03b3.03b3.example.opentlc.com
+*  start date: Jun 16 06:03:05 2020 GMT
+*  expire date: Sep 14 06:03:05 2020 GMT
+*  subjectAltName: host "incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com" matched cert's "*.apps.cluster-03b3.03b3.example.opentlc.com"
+*  issuer: C=US; O=Let's Encrypt; CN=Let's Encrypt Authority X3
+*  SSL certificate verify ok.
+> GET /incident/b0112795-a005-4d37-8d0e-eaeeb6fcb533 HTTP/1.1
+> Host: incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICItOUE4OXJkcGlENlNZLXNBVHZULWtETmtEU28wSkRDTm4xd2ppbkU4OUM0In0.eyJqdGkiOiI4NDVkZDFkMS01YzkxLTRkMWUtODA0YS1lZTQ0M2E1OWEzOGUiLCJleHAiOjE1OTYwOTI5NTEsIm5iZiI6MCwiaWF0IjoxNTk2MDkyNjUxLCJpc3MiOiJodHRwczovL3Nzby11c2
+VyLXNzby5hcHBzLmNsdXN0ZXItMDNiMy4wM2IzLmV4YW1wbGUub3BlbnRsYy5jb20vYXV0aC9yZWFsbXMvZW1lcmdlbmN5LXJlc3BvbnNlLWV4dGVybmFsLTIiLCJhdWQiOiJhY2NvdW50Iiwic3ViIjoiN2RhZmE5MmMtMjhhZi00MTgwLWI3YzMtZDJjYzQwYTI4NDA4IiwidHlwIjoiQmVhcmVyIiwiYXpwIjoiaW5jaWRlbnQtZmluZGVyIiwiYXV0aF90aW1lIjowLCJzZXNz
+aW9uX3N0YXRlIjoiNGRkYjI3MTMtZmM5Ny00ZDEwLWFkYmYtMmNmNjBlODRmZDA0IiwiYWNyIjoiMSIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJvZmZsaW5lX2FjY2VzcyIsInVtYV9hdXRob3JpemF0aW9uIl19LCJyZXNvdXJjZV9hY2Nlc3MiOnsiYWNjb3VudCI6eyJyb2xlcyI6WyJtYW5hZ2UtYWNjb3VudCIsIm1hbmFnZS1hY2NvdW50LWxpbmtzIiwidmlldy1wcm
+9maWxlIl19fSwic2NvcGUiOiJwcm9maWxlIGVtYWlsIiwiZW1haWxfdmVyaWZpZWQiOmZhbHNlLCJuYW1lIjoiQmVybmFyZCBUaXNvbiIsInByZWZlcnJlZF91c2VybmFtZSI6ImJ0aXNvbiIsImdpdmVuX25hbWUiOiJCZXJuYXJkIiwiZmFtaWx5X25hbWUiOiJUaXNvbiIsImVtYWlsIjoiYnRpc29uQHJlZGhhdC5jb20ifQ.IdpNMrGgDuTNAiIB0YOjckRQQcptK1H0lThua
+y1T835jn1zWjEqME6_XyM0m0LbWO33QVve0TjVT_VsCQW3VlIfqINQRhu9Vfl6YAAwcq62RbpKNMTklm1HuYTlf1Ph_sn_by5JnmtD-Jxa4aHQLXMUBk1IvKqZw2l_SjorNZ8egEzEhevyQAMRWfDutWDD1-FLjO7MbMyYML8TPhRrDuSvICXMtQ66kNbB8kfLw5EZKDZS2pQXf9ICqdNN0U9uZQhe12nnb3C_lj0sm0qekxrWwOvw8PwB3P20Koc3WzYJApTM3yZIUnb1_4YdoQHP
+WvkDBvjbx6H_LZA1CKi9CDw
+> 
+* Mark bundle as not supporting multiuse 
+< HTTP/1.1 200 OK
+< content-length: 382 
+< content-type: application/json
+< set-cookie: 474696dd8b7afc576361cdde6e68ae17=be8d6ecfbce23713204420477da7e3f6; path=/; HttpOnly; Secure
+< cache-control: private
+<
+* Connection #0 to host incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com left intact
+{"id":"b0112795-a005-4d37-8d0e-eaeeb6fcb533","lat":34.17718,"lon":-77.84374,"numberOfPeople":4,"medicalNeeded":true,"timestamp":1595878316378,"victimName":"Hudson Tyrrell","victimPhoneNumber":"(336) 555-8097","status":"RESCUED","currentPositionLat":34.1707,"currentPositionLon":-77.
+9484,"destinationLat":34.1706,"destinationLon":-77.949,"destinationName":"Wilmington Marine Center"}
+----
+
+. To test that the incident aggregation service is correctly propagating the token when calling its peers, scale up the incident aggregation service pods to 2. Repeat the `curl` command a couple of times. Expect all calls to succeed.
++
+----
+$ oc scale dc incident-aggregation-service --replicas=2
+----
+
+. In a browser window, navigate to the incident finder service. Log in if required. Execute a search. Expect the search to fail.
++
+image::images/incident-finder-service-fail.png[]
+
+. Check the logs of the incident finder application pod. Expect to find a log statement indicating that the call to the incident aggregation service is not authorized.
++
+----
+2020-07-30 07:10:21,037 INFO  [com.red.eme.res.inc.fin.IncidentResource] (executor-thread-1) Principal: btison
+2020-07-30 07:10:21,206 ERROR [com.red.eme.res.inc.fin.IncidentAggregationService] (vert.x-eventloop-thread-1) Error when calling incident aggregation service. Return code 401
+----
+
+. JSON Web Tokens are not automatically propagated when calling a secured upstream service. To propagate the JSON Web Token from the incident finder application to the incident aggregation service, you need to explicitly add code to propagate the token. 
+* Inject the JSON Web Token instance in the `IncidentAggregationService` class of the incident finder service:
++
+----
+    @Inject
+    JsonWebToken jsonWebToken;
+----
+* In the `incidentById` method, add the token to the headers of the outgoing call:
++
+----
+        log.info("Token = " +  jsonWebToken.getTokenID());
+        return webClient.get("/incident/" + id).bearerTokenAuthentication(jsonWebToken.getRawToken()).send().onItem().transform(resp -> {
+            [...]
+        });
+----
+* Build the application, create an image and push to OPenShift
++
+----
+$ mvn package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-security/incident-finder-service:secure .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-security/incident-finder-service:secure
+----
+* Test the incident finder application again. Expect it to work correctly now.
+
+=== Implement Role Based Access Control 
+
+Until now, you only implemented authentication when securing the incident finder and incident aggregation services. 
+
+Quarkus comes with built-in security to allow for Role Based Access Control (RBAC) based on the `javax.annotation.security` security annotations `@RolesAllowed`, `@DenyAll`, `@PermitAll` on REST endpoints and CDI beans.
+
+Let's assume that the `GET /incident` endpoint of the aggregation service should only be accessible for authenticated users who have the role `user`. This requirement can easily be implemented using the `@RolesAllowed` annotation.
+
+. In the `IncidentResource` class of the incident aggregation service project, replace the `@Authenticated` annotation with the `@RolesAllowed("user")` annotation. 
++
+----
+    @GET
+    @Path("/incident/{id}")
+    @RolesAllowed("user")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response getIncident(@PathParam("id") String id) {
+        [...]
+    }
+----
+
+. Build the application, create an image and push the image to OpenShift.
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-security/incident-aggregation-service:secure .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-security/incident-aggregation-service:secure
+----
+
+. Obtain an access token from the SSO server, and call the incident aggregation service using `curl`. Replace `<username>` and `<password>` with the username and password you chose when registering for the incident finder service.
++
+----
+$ TKN=$(curl -X POST "https://${SSO_URL}/auth/realms/emergency-response-external/protocol/openid-connect/token" -H "Content-Type: application/x-www-form-urlencoded"  -d "username=<username>" -d "password=<password>" -d "grant_type=password" -d "client_id=incident-finder" | sed 's/.*access_token":"//g' | sed 's/".*//g')
+$ curl -v -H "Authorization: Bearer ${TKN}" ${INCIDENT_AGGREGATION_SERVICE_URL}/incident/<incident id>
+----
++
+.Sample output
++
+----
+*   Trying 18.158.125.5:443...
+* Connected to incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com (18.158.125.5) port 443 (#0)
+[...]
+> GET /incident/b0112795-a005-4d37-8d0e-eaeeb6fcb533 HTTP/1.1
+> Host: incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICItOUE4OXJkcGlENlNZLXNBVHZULWtETmtEU28wSkRDTm4xd2ppbkU4OUM0In0.eyJqdGkiOiIzZmY1OWVhZi05YmNlLTQ5ZGMtOTEyMC1iZWE2ZTZmZDE4ZTUiLCJleHAiOjE1OTYwOTYxMjcsIm5iZiI6MCwiaWF0IjoxNTk2MDk1ODI3LCJpc3MiOiJodHRwczovL3Nzby11c2VyLXNzby5hcHBzLmNsdXN0ZXItMDNiMy4wM2IzLmV4YW1wbGUub3BlbnRsYy5jb20vYXV0aC9yZWFsbXMvZW1lcmdlbmN5LXJlc3BvbnNlLWV4dGVybmFsLTIiLCJhdWQiOiJhY2NvdW50Iiwic3ViIjoiN2RhZmE5MmMtMjhhZi00MTgwLWI3YzMtZDJjYzQwYTI4NDA4IiwidHlwIjoiQmVhcmVyIiwiYXpwIjoiaW5jaWRlbnQtZmluZGVyIiwiYXV0aF90aW1lIjowLCJzZXNzaW9uX3N0YXRlIjoiMTYwNjQxNmItZTk0ZS00N2E5LWJiZmUtODEzMzViZDRlNWY4IiwiYWNyIjoiMSIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJvZmZsaW5lX2FjY2VzcyIsInVtYV9hdXRob3JpemF0aW9uIl19LCJyZXNvdXJjZV9hY2Nlc3MiOnsiYWNjb3VudCI6eyJyb2xlcyI6WyJtYW5hZ2UtYWNjb3VudCIsIm1hbmFnZS1hY2NvdW50LWxpbmtzIiwidmlldy1wcm9maWxlIl19fSwic2NvcGUiOiJwcm9maWxlIGVtYWlsIiwiZW1haWxfdmVyaWZpZWQiOmZhbHNlLCJuYW1lIjoiQmVybmFyZCBUaXNvbiIsInByZWZlcnJlZF91c2VybmFtZSI6ImJ0aXNvbiIsImdpdmVuX25hbWUiOiJCZXJuYXJkIiwiZmFtaWx5X25hbWUiOiJUaXNvbiIsImVtYWlsIjoiYnRpc29uQHJlZGhhdC5jb20ifQ.XUrneZoKnOld_1S07oZuRwCzWohvo4pmcm3eO0dz0HOUCOR3YVHyyUrj_eGcmXnA_0PIfCpDG-b7VmpymRY9GHfXSa4dANkT2A1n7zNVDqvYNxnvzZmypi21wFFcbbTerRBr2lZ2QBXIDZekuXcwcWceeviZ2BEjGDokNun8o_ze6KXskQDVvyXHzg2Ew4ewUa475bpfq9hZj-hdLi6OGSzhlLWhuL2L0lRXRq_T8JUZofMIrgWFyi0_mhvdBfSupscNbawDiTU3fkbQtBzTlFs4VzivBxUc2XTon7klDPSwU1xJGBiA28uSgDaJWlTNDnVM4mKbVA0bbjhuXdOQRA
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 403 Forbidden
+< content-length: 9
+< content-type: application/json
+< set-cookie: 474696dd8b7afc576361cdde6e68ae17=4438c168970ff9adddf80b6042e1dc7c; path=/; HttpOnly; Secure
+< 
+* Connection #0 to host incident-aggregation-user2-security.apps.cluster-03b3.03b3.example.opentlc.com left intact
+Forbidden
+----
+
+. The `403 Forbidden` return code is expected, as the authenticated user doesn't have the role `user`. The role can be added to the user profile in the SSO server.
+* Log in into the SSO administration console. Select the `emergency-response-external` realm. Select _Roles_ in the left menu to view the list of roles in the realm. Click _Add role_ to create a new role.
++
+image::images/sso-realm-roles.png[]
++
+image::images/sso-add-role.png[]
+* Enter `user` as name of the role. Click _Save_.
+* Select _Users_ form the left menu. Click _View all users_ to see the list of the users defined in the realm. Select the user you use for the incident finder application. In the user overview page, select the _Role Mappings_ tab.
++
+image::images/sso-user-roles.png[]
+* Add the `user` role to the assigned roles for the user:
++
+image::images/sso-user-roles-assigned.png[]
+
+. Obtain an access token from the SSO server, and call the incident aggregation service using `curl`. Expect the call to succeed.
+
+== Centralize Security Policies with Red Hat SSO Authorization Services
+
+In the labs until now, the security policies - who can access what - are defined in the application itself, through configuration or security annotations. 
+
+An alternative consists in leveraging Red Hat SSO Authorization Services to externalize authorization from the application. By doing so, you can protect your applications using different access control mechanisms as well as avoid re-deploying your application every time the security requirements change. In this scenario, Red Hat SSO acts as a centralized authorization service from where your protected resources and their associated permissions are managed.
+
+In this lab you apply this principle to the incident aggregation service.
+
+=== Configure the SSO Realm Client for Authorization
+
+The first thing you need to do is setting up the security policies in the Red Hat SSO realm client.
+
+. Log in into the SSO administration console. Select the `emergency-response-external` realm. Select _Clients_ in the left menu to view the list of clients in the realm. Open the `incident-aggregation` client.
++
+image::images/sso-incident-aggregation-client.png[]
++
+* In order to use the Authorization Service, the _Access Type_ of the client has to be changed to `confidential`. The reason is that the SSO adapter on the application needs to authenticate with the SSO server using the client ID and the client secret to work. A client secret is only defined for `confidential` clients.
+* Set _Authorization Enabled_ to `ON`.
++
+image::images/sso-realm-enable-authorization.png[]
+* Enter "/" in the _Valid Redirect URIs_ box. You won't be able to save the client unless a redirect URI is defined. It won't be used, so it doesn't really matter what value you enter.
+* Click _Save_.
+
+. In the _Credentials_ tab, copy the value of the client secret. The secret will have to be added to the application configmap.
++
+image::images/sso-client-secret.png[]
+
+. Open the _Authorizations_ tab. This is where you define the security policies for your application. At a minimum, you will need to define _Resources_, _Policies_ and _Permissions_. +
+For this lab, you import a JSON file with predefined settings.
+* Create a file on your local file system with the following contents:
++
+----
+$ echo '
+{
+  "allowRemoteResourceManagement": true,
+  "policyEnforcementMode": "ENFORCING",
+  "resources": [
+    {
+      "name": "User Resource",
+      "ownerManagedAccess": false,
+      "attributes": {},
+      "uris": [
+        "/incident/*"
+      ]
+    }
+  ],
+  "policies": [
+    {
+      "name": "User Policy",
+      "description": "Any user granted with the user role can access something",
+      "type": "role",
+      "logic": "POSITIVE",
+      "decisionStrategy": "UNANIMOUS",
+      "config": {
+        "roles": "[{\"id\":\"user\",\"required\":false}]"
+      }
+    },
+    {
+      "name": "User Resource Permission",
+      "type": "resource",
+      "logic": "POSITIVE",
+      "decisionStrategy": "UNANIMOUS",
+      "config": {
+        "resources": "[\"User Resource\"]",
+        "applyPolicies": "[\"User Policy\"]"
+      }
+    }
+  ],
+  "scopes": []
+}
+' | tee /tmp/authorization.json
+----
+* In the _Settings_ tab of _Authorization_, click `Select File` to upload the `authorization.json` file. Click `Import` to apply the file contents.
+* Review the resources created by the file import:
+** _Resources/User Resource_: defines a resource based on URI, in this case `incident/*`
+** _Policies/User Policy_: defines a policy for users with role `user`.
+** _Permissions/User Resource Permission_: defines a permission which applies the policy on the resource. This boils down to the following security policy: "Only authenticated users with role `user` can access resources with URI `/incident/*`".
+
+=== Configure the Incident Aggregation Service to use SSO Authorization Services.
+
+Next step is to configure the incident aggregation service to leverage the SSO Authorization Services.
+
+. Add the following dependency to the `pom.xml` file of the incident aggregation service project:
++
+----
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-keycloak-authorization</artifactId>
+    </dependency>
+----
+
+. In the `IncidentResource` class, remove the `@RolesAllowed("user")` annotation from the `getIncident` method.
+
+. In the `src/main/resources/application.properties` file, add the following configuration settings:
++
+----
+quarkus.keycloak.policy-enforcer.enable=true
+quarkus.keycloak.policy-enforcer.paths.1.path=/health
+quarkus.keycloak.policy-enforcer.paths.1.enforcement-mode=DISABLED
+quarkus.keycloak.policy-enforcer.paths.2.path=/health/*
+quarkus.keycloak.policy-enforcer.paths.2.enforcement-mode=DISABLED
+----
++
+The `quarkus.keycloak.policy-enforcer.paths.*` define local policies based on paths to exclude central policy enforcement. In this case you need to exclude the health checks.
+
+. Before deploying the modified application to OpenShift, edit the application configmap. In the configmap, add the following setting:
++
+----
+quarkus.oidc.credentials.secret=<client secret>
+----
++
+Substitute `client secret` with the value for the secret value for the `incident-aggregation` realm client. You can find the secret in the SSO administration console, under _Clients -> incident-aggregation -> Credentials_.
+
+. Build the application, create an image and push the image to OpenShift.
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-security/incident-aggregation-service:secure .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-security/incident-aggregation-service:secure
+----
+
+. Once the application is redeployed, verify that the security configuration works as expected:
+* A call to `GET /incident/{incidentId}` without valid token should return a `401 Unauthorized` HTTP response code.
+* A call to `GET /incident/{incidentId}` with a valid token but for a user which has not the `user` role should return a `403 Forbidden` HTTP response code. You can create an additional user in the SSO realm to test this scenario.
+* A call to `GET /incident/{incidentId}` with a valid token but for a user which has the `user` role should return a `200 OK` HTTP response code, and the JSON representation of the incident as a response.
+* A call to `GET /health` should return a `200 OK` HTTP response code, and does not require a token.

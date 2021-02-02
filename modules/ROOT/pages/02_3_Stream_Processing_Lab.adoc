@@ -1,0 +1,695 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== Streams Processing with Kafka Streams Lab
+
+.Prerequisites
+* Access to the Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6.x
+
+.Goals
+* Use Kafka Streams to process event streams
+
+:numbered:
+
+== Introduction
+
+Kafka Streams is a client library for building streaming applications, specifically applications that transform input Kafka topics into output Kafka topics (or calls to external services, or updates to databases, or whatever). It lets you do this with concise code in a way that is distributed and fault-tolerant. Kafka Streams allows to approach state available as streams of data as if they were tables like in a relational database. A good introduction to some core concepts of Kafka Streams, more specifically the duality between streams and tables can be found at https://www.confluent.io/blog/kafka-streams-tables-part-1-event-streaming.
+
+In this lab you will work on the following use case: a new requirement came up for a service in the Emergency Response application to provide aggregated data about an incident. More specifically, the incident needs to be enriched with the name and the location of the shelter where the evacuees are being brought to, and the current location of the evacuees. This information is not available in one place, but is managed by three services: the incident service has information about the incident, the mission service knows the current location of the incident, and the disaster service has the information about the shelters. The mission service and the incident service produce Kafka messages which reflect the latest state.
+
+There are of course several ways to implement the requirement, but this seems like a nice use case for Kafka Streams: the event stream from the incident service can be joined to the event stream of the mission service and the information of both streams combined and stored in its own stream.
+
+In this lab you start with a skeleton Quarkus application for the new incident aggregation service. You add the implementation using Kafka Streams joining event streams from the incident service and the mission service. Then you add a Kafka Streams interactive query and a REST endpoint to provide the latest incident data by incident id. Finally you will learn how to scale out the service.
+
+== Implement the Incident Aggregation Service
+
+. Check out the code for the incident aggregation service.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/incident-aggregation-service.git
+----
+. Import the code into your IDE of choice.
+. Ensure the code builds correctly:
++
+----
+$ mvn clean package
+----
+. Review the code. This is a skeleton project which contains the model classes, as well as the code to retrieve the shelter names from the disaster service using a MicroProfile REST client.
+
+. Quarkus comes with an extension for Kafka Streams. Add the following dependencies to the `pom.xml` file of the project:
++
+----
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-kafka-streams</artifactId>
+    </dependency>
+----
+
+. To use Kafka Streams in an application, you provide a Kafka Streams `Topology`, which defines the logic for the event stream processing functionality. +
+In Quarkus, Kafka Streams is integrated with CDI, and the Kafka Streams `Topology` is created with a CDI producer method.
+* Create a class `com.redhat.emergency.response.incident.aggregation.streams.TopologyProducer`. Annotate the class with the CDI `@ApplicationScoped` annotation.
+* Create a method `buildTopology` which returns a Kafka Streams `Topology`. Annotate the method with the CDI `javax.enterprise.inject.@Produces` annotation. In the method, create a `StreamsBuilder` instance, and return the `Topology` produced by the `build` method of the `StreamsBuilder`.
++
+----
+@ApplicationScoped
+public class TopologyProducer {
+
+    @javax.enterprise.inject.Produces
+    public Topology buildTopology() {
+        StreamsBuilder builder = new StreamsBuilder();
+        
+        return builder.build();
+    }
+----
+. In the implementation, you need to join two streams of events. The first stream is from the mission service, the second from the incident service. +
+In Kafka Streams, streams can be represented as a `KTable`, which is an abstraction of a _changelog stream_, where each data record represents an update. In other words, the `KTable` provides the ability to look up current values of data records by keys. +
+For the incident aggregation service, you build a `KTable` for events emitted by the mission service, more specifically _MissionStartedEvent_, _MissionPickedUpEvent_ and _MissionCompletedEvent_. These events use the incident ID as a key. Unwanted events are filtered out, and the payload of the incoming events is mapped to a `Mission` object. +
+Add the following code to the `TopologyProducer` class to build the mission `KTable`:
++
+----
+@ApplicationScoped
+public class TopologyProducer {
+
+    private static final Logger log = LoggerFactory.getLogger(TopologyProducer.class);
+
+    private static final String MISSION_STARTED_EVENT = "MissionStartedEvent";
+    private static final String MISSION_PICKEDUP_EVENT = "MissionPickedUpEvent";
+    private static final String MISSION_COMPLETED_EVENT = "MissionCompletedEvent";
+    private static final String[] MISSION_ACCEPTED_MESSAGE_TYPES = {MISSION_STARTED_EVENT, MISSION_PICKEDUP_EVENT, MISSION_COMPLETED_EVENT};
+
+    @ConfigProperty(name = "kafka.topic.mission-event")
+    String missionEventTopic;
+
+    @Produces
+    public Topology buildTopology() {
+
+        StreamsBuilder builder = new StreamsBuilder();
+
+        KTable<String, Mission> missions = builder.table(missionEventTopic, Consumed.with(Serdes.String(), Serdes.String()))
+                .mapValues(value -> {
+                    try {
+                        io.vertx.core.json.JsonObject json = new io.vertx.core.json.JsonObject(value);
+                        log.debug("Processing message: " + value);
+                        return json;
+                    } catch (Exception e) {
+                        log.warn("Unexpected message which is not a valid JSON object");
+                        return new io.vertx.core.json.JsonObject();
+                    }
+                })
+                .filter((key, value) -> {
+                    String messageType = value.getString("messageType");
+                    if (Arrays.asList(MISSION_ACCEPTED_MESSAGE_TYPES).contains(messageType)) {
+                        return true;
+                    }
+                    log.debug("Message with type '" + messageType + "' is ignored");
+                    return false;
+                }).mapValues(value -> {
+                    io.vertx.core.json.JsonObject body = value.getJsonObject("body");
+                    try {
+                        return body.mapTo(Mission.class);
+                    } catch (Exception e) {
+                        log.error("Exception while deserializing Mission", e);
+                        return null;
+                    }
+                });
+
+        return builder.build();
+    }
+}
+----
+* The `KTable` is built from messages consumed from the `missionEventTopic`, and deserialized using a String deserializer - the payload and the key of the messages is expected to be a String.
+* The first `mapValues` call and the `filter` call filter out unwanted messages. Although you can go from the assumption that messages consumed from the mission event topic have the expected structure, it is a good practice to verify this in the code, and protect your service from so-called _poison pill_ messages.
+* The final call to `mapValues` transforms the payload to a `Mission` object.
+* The result is a `KTable` of mission objects using the incident ID as the key.
+
+. Next step is building a `KTable` of incidents from the events emitted by the incident service, more specifically _IncidentReportedEvent_ and _IncidentUpdatedEvent_ events. Events emitted by the incident service also use the incident ID as a key. +
+Add the following code to the `TopologyProducer` class to build the incident `KTable`: 
++
+----
+@ApplicationScoped
+public class TopologyProducer {
+
+    [...]
+
+    private static final String INCIDENT_REPORTED_EVENT = "IncidentReportedEvent";
+    private static final String INCIDENT_UPDATED_EVENT = "IncidentUpdatedEvent";
+    private static final String[] INCIDENT_ACCEPTED_MESSAGE_TYPES = {INCIDENT_REPORTED_EVENT, INCIDENT_UPDATED_EVENT};
+
+    @ConfigProperty(name = "kafka.topic.incident-event")
+    String incidentEventTopic;
+
+    @Produces
+    public Topology buildTopology() {
+
+        [...]]
+
+        KTable<String, Incident> incidents = builder.table(incidentEventTopic, Consumed.with(Serdes.String(), Serdes.String()))
+                .mapValues(value -> {
+                    try {
+                        io.vertx.core.json.JsonObject json = new io.vertx.core.json.JsonObject(value);
+                        log.debug("Processing message: " + value);
+                        return json;
+                    } catch (Exception e) {
+                        log.warn("Unexpected message which is not a valid JSON object");
+                        return new io.vertx.core.json.JsonObject();
+                    }
+                }).filter((key, value) -> {
+                    String messageType = value.getString("messageType");
+                    if (Arrays.asList(INCIDENT_ACCEPTED_MESSAGE_TYPES).contains(messageType)) {
+                        return true;
+                    }
+                    log.debug("Message with type '" + messageType + "' is ignored");
+                    return false;
+                }).mapValues(value -> {
+                    io.vertx.core.json.JsonObject body = value.getJsonObject("body");
+                    try {
+                        return body.mapTo(Incident.class);
+                    } catch (Exception e) {
+                        log.error("Exception while deserializing Incident", e);
+                        return null;
+                    }
+                });
+
+        return builder.build();
+    }
+}
+----
+
+. Now you need to join the two KTables. The idea is that whenever an incident event message is consumed from the `incidentEventTopic` topic, the corresponding `Incident` object is enhanced with data from the `Mission` instance with the same instance ID. +
+There is a good analogy with the relational database world: if incidents and missions were each stored in their own table, you would create a view with a join between the two tables to combine records from both tables. The same concept applies to Kafka Streams KTables. The resulting view is stored (or materialized) in a separate _state store_, backed by a Kafka topic. Out of the box, Kafka Streams uses RocksDB (https://rocksdb.org), an embeddable persistent key-value store to provide the state store. +
+Add the following code to the `TopologyProducer` class to build the join between the incident and the mission `KTables`.
++
+----
+@ApplicationScoped
+public class TopologyProducer {
+
+    [...]
+
+    @Inject
+    Shelters shelters;
+
+    @javax.enterprise.inject.Produces
+    public Topology buildTopology() {
+
+        [...]
+
+        ObjectMapperSerde<Incident> incidentSerde = new ObjectMapperSerde<>(Incident.class);
+
+        incidents.leftJoin(missions, (incident, mission) -> {
+                if (mission == null) {
+                    return incident;
+                }
+                incident.setDestinationLat(mission.getDestinationLat());
+                incident.setDestinationLon(mission.getDestinationLong());
+                incident.setDestinationName(destinationName(mission.getDestinationLat(), mission.getDestinationLong()));
+                if (mission.getResponderLocationHistory().isEmpty()) {
+                    incident.setCurrentPositionLat(incident.getLat());
+                    incident.setCurrentPositionLon(incident.getLon());
+                } else {
+                    int last = mission.getResponderLocationHistory().size() - 1;
+                    incident.setCurrentPositionLat(mission.getResponderLocationHistory().get(last).getLat());
+                    incident.setCurrentPositionLon(mission.getResponderLocationHistory().get(last).getLon());
+                }
+                return incident;
+        }, Materialized.<String, Incident, KeyValueStore<Bytes, byte[]>> as("incidents-store").withKeySerde(Serdes.String()).withValueSerde(incidentSerde));
+
+        return builder.build();
+    }
+
+    private String destinationName(BigDecimal lat, BigDecimal lon) {
+        return shelters.getShelters().stream()
+                .filter(shelter -> shelter.getLat().equals(lat) && shelter.getLon().equals(lon))
+                .map(Shelter::getName).findFirst().orElse("");
+    }
+----
+* The `incident` object is enriched with data from the current known state of the `mission` object with the same key.
+* The result of the join is materialized as a `KeyValueStore`. Both key and value are serialized to a byte array. To serialize the incident you use an `ObjectMapperSerde`, which under the hood uses a Jackson object mapper to serialize the incident to a JSON byte array.
+* The name of the shelters is not available in the mission or incident messages. So you do a REST call to the disaster service to get the data about the shelters and get the name based on the coordinates.
++
+NOTE: The disaster service of the Emergency Response application could be enhanced to emit an event every time a shelter is created or modified. These events could be captured in the incident aggregation service and joined to the incident KTable to provide the same functionality as the REST call.
+
+== Deploy and Test the Incident Aggregation Service
+
+Now you are ready to deploy the incident aggregation service to the OpenShift cluster. You deploy the service in its own namespace, but using the Kafka cluster and disaster service from the Emergency Response application.
+
+The instructions assume you have deployed the Emergency Response application in the `user1-er-demo` OpenShift namespace.
+
+. Create a namespace for the service:
++
+----
+$ oc new-project user1-kafka-streams
+----
+
+. Create a configmap with the configuration of the service.
++
+----
+$ echo '
+quarkus.log.category."org.apache.kafka.common.utils".level=WARN
+quarkus.log.category."org.apache.kafka.clients.admin".level=WARN
+quarkus.log.category."com.redhat.emergency.response.incident.aggregation.streams".level=DEBUG
+quarkus.log.console.level=DEBUG
+
+shelters/mp-rest/url=http://disaster-service.user1-er-demo.svc:8080
+
+quarkus.kafka-streams.bootstrap-servers=kafka-cluster-kafka-bootstrap.user1-er-demo.svc:9092
+quarkus.kafka-streams.application-id=incident-aggregation
+quarkus.kafka-streams.topics=topic-incident-event,topic-mission-event
+
+kafka.topic.incident-event=topic-incident-event
+kafka.topic.mission-event=topic-mission-event
+
+# streams options
+kafka-streams.cache.max.bytes.buffering=10240
+kafka-streams.commit.interval.ms=1000
+kafka-streams.metadata.max.age.ms=500
+kafka-streams.auto.offset.reset=earliest
+kafka-streams.metrics.recording.level=DEBUG
+
+' | tee /tmp/application.properties
+$ oc create configmap incident-aggregation-service -n user1-kafka-streams --from-file=/tmp/application.properties
+----
++
+* The `shelters/mp-rest/url` points to the disaster service instance of the Emergency Response application deployed in the `user1-er-demo` namespace.
+* The `quarkus.kafka-streams.bootstrap-servers` points to the Kafka cluster in the `user1-er-demo` namespace.
+* `quarkus.kafka-streams.topics` is a feature of the Quarkus Kafka Streams integration: the Kafka Streams engine won't be bootstrapped before the topics defined in the property are available on the Kafka broker.
+* `quarkus.kafka-streams.application-id` sets the unique id of the Kafka Streams application. 
+
+. Create a deploymentconfig for the incident aggregation service:
++
+----
+$ echo '
+apiVersion: apps.openshift.io/v1
+kind: DeploymentConfig
+metadata:
+  labels:
+    app: incident-aggregation-service
+  name: incident-aggregation-service
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    app: incident-aggregation-service
+    group: erd-services
+  strategy:
+    type: Recreate
+    recreateParams:
+      timeoutSeconds: 600
+    resources: {}
+    activeDeadlineSeconds: 21600
+  template:
+    metadata:
+      labels:
+        app: incident-aggregation-service
+        group: erd-services
+    spec:
+      containers:
+      - imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health/live
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 1
+        name: incident-aggregation-service
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health/ready
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 3
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: 250m
+            memory: 250Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /deployments/config
+          name: config
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - configMap:
+          defaultMode: 420
+          name: incident-aggregation-service
+        name: config
+  triggers:
+  - type: ConfigChange
+  - imageChangeParams:
+      automatic: true
+      containerNames:
+      - incident-aggregation-service
+      from:
+        kind: ImageStreamTag
+        name: incident-aggregation:latest
+    type: ImageChange
+' | oc create -f - -n user1-kafka-streams
+----
+
+. Build the incident aggregation application, create an image and push the image to the OpenShift registry:
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-kafka-streams/incident-aggregation:latest .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-kafka-streams/incident-aggregation:latest
+----
+
+. Once the incident aggregation service pod is up and running, verify the topics on the Kafka cluster:
++
+----
+$ oc get kafkatopic -n user1-er-demo
+----
++
+.Sample output
+----
+NAME                                                                                                               PARTITIONS   REPLICATION FACTOR
+consumer-offsets---84e7a678d08f4bd226872e5cdd4eb527fadc1c6a                                                        50           3
+incident-aggregation-incidents-store-changelog                                                                          15           1
+incident-aggregation-topic-incident-event-state-store-0000000006-changelog---8f8f31f4d4e90ef6168d99b122146cd5fd1bd116   15           1
+incident-aggregation-topic-mission-event-state-store-0000000000-changelog---7b027c611f1079be58b477809160593aae51971e    15           1
+topic-incident-command                                                                                             15           3
+topic-incident-event                                                                                               15           3
+topic-mission-command                                                                                              15           3
+topic-mission-event                                                                                                15           3
+topic-responder-command                                                                                            15           3
+topic-responder-event                                                                                              15           3
+topic-responder-location-update
+----
++
+Notice the three topics starting with `incident-aggregation`. Those are the topics created to back the KTables and the state store created in the incident aggregation Kafka Streams topology.
+
+. To have a better idea how this all works, you can deploy the Kafka consumer application to consume and log the messages sent to the `incident-aggregation-incidents-store-changelog` topic. Execute the following Ansible playbook from the `ansible` directory of the `erdemo-install` project:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_consumer_app.yml -e project_admin=user1 -e project_name=kafka-streams -e kafka_topic=incident-aggregation-incidents-store-changelog -e kafka_bootstrap_address=kafka-cluster-kafka-bootstrap.user1-er-demo.svc:9092
+----
+
+. In a browser window, navigate to the Emergency Response console application, and start a simulation.
+
+. Check the logs of the Kafka consumer app pod. Expect to see the log of the messages created in the `incident-aggregation-incidents-store-changelog` topic by the Kafka Streams application:
++
+----
+2020-07-19 07:04:47,996 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-66) Consumed message from topic 'incident-aggregation-incidents-store-changelog', partition '14', offset '2'
+2020-07-19 07:04:47,996 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-66)     Headers: 
+2020-07-19 07:04:47,997 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-66)     Message key: 87d23c7e-7ca9-42fa-a90e-568d729cc586
+2020-07-19 07:04:47,997 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-66)     Message value: {"id":"87d23c7e-7ca9-42fa-a90e-568d729cc586","lat":34.17149,"lon":-77.89421,"numberOfPeople":2,"medicalNeeded":false,"timestamp":1595142156308,"victimName":"Alice Echevarria","victimPhoneNumber":"(704) 555-4327","status":"RESCUED","currentPositionLat":34.1707,"currentPositionLon":-77.9484,"destinationLat":34.1706,"destinationLon":-77.949,"destinationName":"Wilmington Marine Center"}
+2020-07-19 07:05:18,080 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-67) Consumed message from topic 'incident-aggregation-incidents-store-changelog', partition '0', offset '3'
+2020-07-19 07:05:18,081 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-67)     Headers: 
+2020-07-19 07:05:18,081 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-67)     Message key: 76173a7a-e86b-4c26-828c-f78e502afedd
+2020-07-19 07:05:18,081 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-67)     Message value: {"id":"76173a7a-e86b-4c26-828c-f78e502afedd","lat":34.20591,"lon":-77.9456,"numberOfPeople":1,"medicalNeeded":true,"timestamp":1595142176311,"victimName":"William Green","victimPhoneNumber":"(252) 555-0228","status":"RESCUED","currentPositionLat":34.1707,"currentPositionLon":-77.9484,"destinationLat":34.1706,"destinationLon":-77.949,"destinationName":"Wilmington Marine Center"}
+2020-07-19 07:05:18,095 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-68) Consumed message from topic 'incident-aggregation-incidents-store-changelog', partition '1', offset '8'
+2020-07-19 07:05:18,095 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-68)     Headers: 
+2020-07-19 07:05:18,095 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-68)     Message key: 11d4544a-4d42-4fab-8fdd-27714ec164bd
+2020-07-19 07:05:18,095 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-68)     Message value: {"id":"11d4544a-4d42-4fab-8fdd-27714ec164bd","lat":34.23043,"lon":-77.89622,"numberOfPeople":1,"medicalNeeded":false,"timestamp":1595142174312,"victimName":"Samuel Wilson","victimPhoneNumber":"(336) 555-3587","status":"RESCUED","currentPositionLat":34.2462,"currentPositionLon":-77.9521,"destinationLat":34.2461,"destinationLon":-77.9519,"destinationName":"Port City Marina"}
+----
+
+. Check the logs for messages belonging to the same incident. Expect to find several messages, one message per mission update event message emitted by the mission service. For example, for the incident with id `76173a7a-e86b-4c26-828c-f78e502afedd`:
++
+----
+2020-07-19 07:03:16,752 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-14) Consumed message from topic 'incident-aggregation-incidents-store-changelog', partition '0', offset '0'
+2020-07-19 07:03:16,752 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-14)     Headers: 
+2020-07-19 07:03:16,752 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-14)     Message key: 76173a7a-e86b-4c26-828c-f78e502afedd
+2020-07-19 07:03:16,752 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-14)     Message value: {"id":"76173a7a-e86b-4c26-828c-f78e502afedd","lat":34.20591,"lon":-77.9456,"numberOfPeople":1,"medicalNeeded":true,"timestamp":1595142176311,"victimName":"William Green","victimPhoneNumber":"(252) 555-0228","status":"ASSIGNED","currentPositionLat":34.20591,"currentPositionLon":-77.9456,"destinationLat":34.1706,"destinationLon":-77.949,"destinationName":"Wilmington Marine Center"}
+
+2020-07-19 07:04:47,715 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-51) Consumed message from topic 'incident-aggregation-incidents-store-changelog', partition '0', offset '1'
+2020-07-19 07:04:47,715 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-51)     Headers: 
+2020-07-19 07:04:47,715 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-51)     Message key: 76173a7a-e86b-4c26-828c-f78e502afedd
+2020-07-19 07:04:47,715 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-51)     Message value: {"id":"76173a7a-e86b-4c26-828c-f78e502afedd","lat":34.20591,"lon":-77.9456,"numberOfPeople":1,"medicalNeeded":true,"timestamp":1595142176311,"victimName":"William Green","victimPhoneNumber":"(252) 555-0228","status":"PICKEDUP","currentPositionLat":34.206,"currentPositionLon":-77.9454,"destinationLat":34.1706,"destinationLon":-77.949,"destinationName":"Wilmington Marine Center"}
+
+2020-07-19 07:05:18,080 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-67) Consumed message from topic 'incident-aggregation-incidents-store-changelog', partition '0', offset '3'
+2020-07-19 07:05:18,081 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-67)     Headers: 
+2020-07-19 07:05:18,081 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-67)     Message key: 76173a7a-e86b-4c26-828c-f78e502afedd
+2020-07-19 07:05:18,081 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-67)     Message value: {"id":"76173a7a-e86b-4c26-828c-f78e502afedd","lat":34.20591,"lon":-77.9456,"numberOfPeople":1,"medicalNeeded":true,"timestamp":1595142176311,"victimName":"William Green","victimPhoneNumber":"(252) 555-0228","status":"RESCUED","currentPositionLat":34.1707,"currentPositionLon":-77.9484,"destinationLat":34.1706,"destinationLon":-77.949,"destinationName":"Wilmington Marine Center"}
+----
+
+== Implement Interactive Query
+
+The result of the Kafka Streams processing pipeline in the incident aggregation service is a topic which is essentially a change log of the incident entities, where the last message for a given incident reflects the current state of that incident. +
+At this point other applications could consume these messages and recreate the state of the incidents. +
+But the state of the incidents can also be made available through for instance a REST endpoint by leveraging Kafka Streams Interactive Queries. Interactive Queries allow you to leverage the state of your application from outside your application, and make the state of the application queryable.
+
+. Create a class `com.redhat.emergency.response.incident.aggregation.streams.IncidentInteractiveQuery` in the incident aggregation project, and annotate the class with the CDI `@ApplicationScoped` annotation.
+. Inject an instance of `KafkaStreams` in the class. + 
+As part of the integration of Quarkus with Kafka Streams, Quarkus creates a CDI producer for the `KafkaStreams` Kafka Streams top level object, and makes it injectable in other CDI beans:
++
+----
+@ApplicationScoped
+public class IncidentInteractiveQuery {
+
+    @Inject
+    KafkaStreams streams;
+
+}
+----
+
+. Add the code to query the incident state store by key:
++
+----
+    public Incident getIncident(String id) {
+        return incidentsStore().get(id);
+    }
+
+    private ReadOnlyKeyValueStore<String, Incident> incidentsStore() {
+        while (true) {
+            try {
+                return streams.store(StoreQueryParameters.fromNameAndType("incidents-store", QueryableStoreTypes.keyValueStore()));
+            } catch (InvalidStateStoreException e) {
+                // ignore, store not ready yet
+            }
+        }
+    }
+----
+
+. Next, create a REST endpoint for the query.
+* Create a class `com.redhat.emergency.response.incident.aggregation.rest.IncidentResource` in the incident aggregation project.
+* Annotate the class with the JAX-RS `@Path("/")` annotation.
+* Inject an instance of `IncidentInteractiveQuery` in the class.
+* Create a REST endpoint which returns the incident obtained from `IncidentInteractiveQuery.getIncident`. If the incident is not found, return a HTTP code 404.
++
+----
+    @GET
+    @Path("/incident/{id}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response getIncident(@PathParam("id") String id) {
+        Incident result = incidentInteractiveQuery.getIncident(id);
+        if (result == null) {
+            return Response.status(Response.Status.NOT_FOUND.getStatusCode()).build();
+        } else {
+            return Response.ok(result).build();
+        }
+    }
+----
+
+. Deploy the new version of the application. Build the code, create an image and push to OpenShift.
+
+. Create a service for the application, and expose the service through a route:
++
+----
+$ echo '
+apiVersion: v1
+kind: Service
+metadata:
+  name: incident-aggregation-service
+spec:
+  ports:
+  - name: http
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: incident-aggregation-service
+    group: erd-services
+' | oc create -f - -n user1-kafka-streams
+$ oc expose service incident-aggregation-service -n user1-kafka-streams
+----
+
+. Test the REST endpoint. Find an existing incident ID if from the logs of the Kafka consumer app.
++
+----
+$ INCIDENT_AGGREGATION_SERVICE_URL=http://$(oc get route incident-aggregation-service -n user1-kafka-streams --template='{{ .spec.host }}')
+$ curl -v ${INCIDENT_AGGREGATION_SERVICE_URL}/incident/<incident id>
+----
++
+.Sample output
+----
+*   Trying 18.194.125.175:80...
+* Connected to incident-aggregation-service-user1-kafka-streams.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 80 (#0)
+> GET /incident/2bf763f7-0fb3-4f9c-a9ec-a1be8f005f53 HTTP/1.1
+> Host: incident-aggregation-service-user1-kafka-streams.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< content-length: 372
+< content-type: application/json
+< set-cookie: d9cd1c6243ce1492dcc52635c5291be7=0995bc5ff5c142b98089ec166aeee87b; path=/; HttpOnly
+< cache-control: private
+< 
+* Connection #0 to host incident-aggregation-service-user1-kafka-streams.apps.cluster-03b3.03b3.example.opentlc.com left intact
+{"id":"2bf763f7-0fb3-4f9c-a9ec-a1be8f005f53","lat":34.24032,"lon":-77.90944,"numberOfPeople":3,"medicalNeeded":false,"timestamp":1595142157309,"victimName":"Owen Brown","victimPhoneNumber":"(704) 555-9031","status":"RESCUED","currentPositionLat":34.2462,"currentPositionLon":-77.9521,"destinationLat":34.2461,"destinationLon":-77.9519,"destinationName":"Port City Marina"}
+----
+
+== Scale Out the Incident Aggregation Service
+
+Due to the nature of Kafka, when the incident aggregation service is scaled out - by increasing the number of pods in the OpenShift cluster - the partitions of the `incident-aggregation-incidents-store-changelog` and the other `incident-aggregation` topics will be distributed over the different pods. So every pod will manage its own state store which contains only a part of the total state. +
+This means that the interactive query might not produce the desired results, as the REST request might end up on a pod which does not manage that particular incident ID.
+
+You can easily test this by scaling up the incident aggregation service to two replicas, and execute the REST call from the previous section of the lab a couple of times. Expect approximately 50% of the calls to return a 404 HTTP response code.
+
+Kafka Streams provides an API to obtain the information which node is hosting a given key through the state store metadata. The application can then either fetch the data directly from the other instance, or point the client to the location of that other node.
+
+However on OpenShift, pods cannot be addressed individually from the outside, so pointing clients to the location of another pod is not really an option if the client is outside of OpenShift. But the pod IP address from the other node can be used to fetch the data from within the application. 
+
+. Add the following dependencies to the `pom.xml` file of the project.
++
+----
+    <dependency>
+      <groupId>io.vertx</groupId>
+      <artifactId>vertx-web-client</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-lang3</artifactId>
+      <version>3.9</version>
+    </dependency>
+----
+* The `vertx-web-client` is used to call the remote node which has the given key.
+
+. Change the `IncidentInteractiveQuery` class to be able to retrieve the node which has the requested key:
+* Inject configuration properties for pod IP adress.
++
+----
+    @ConfigProperty(name = "pod.ip")
+    String podIp;
+----
++
+On OpenShift, every pod has a number of environment variables injected into it. Some of these environment variables are injected automatically, others can be injected by using the OpenShift downward API (https://docs.openshift.com/container-platform/4.4/nodes/containers/nodes-containers-downward-api.html). Here you will use the downward API to inject the pod IP address as an environment variable `POD_IP`. The value of this environment variable can be injected in the `IncidentInteractiveQuery` using the Quarkus `@ConfigProperty` annotation. 
+* Change the code of the `getIncident` method to get the metadata for the given key from the state store. The metadata contains the IP address of the node that manages that particular key. If the IP address is equal to the IP address of the node executing the code you can retrieve the incident from the local node. Otherwise you return the IP address of the node which manages the key.
++
+----
+    public Pair<Incident, String> getIncident(String id) {
+        KeyQueryMetadata metadata = streams.queryMetadataForKey("incidents-store", id, Serdes.String().serializer());
+        if (metadata == null || metadata == KeyQueryMetadata.NOT_AVAILABLE) {
+            log.warn("No metadata found for key: " + id);
+            return null;
+        }
+
+        if (podIp.equals(metadata.getActiveHost().host())) {
+            log.debug("Key available on local host: " + id);
+            return new ImmutablePair<>(incidentsStore().get(id), null);
+        } else {
+            log.debug("Key available on remote host " + metadata.getActiveHost().host() + ": " + id);
+            return new ImmutablePair<>(null, metadata.getActiveHost().host());
+        }
+----
+
+. Next you need to modify the REST endpoint class. In case the local pod has the key, you can return the incident right away. Otherwise you need to fetch it from the remote node which manages that key.
+* Inject an instance of `io.vertx.core.Vertx` into the `IncidentResource` class.
++
+----
+    @Inject
+    Vertx vertx;
+----
++
+The `Vertx` instance is used to create a Vert.x web client, which provides a fluent API to call a remote REST service.
+* Modify the `getIncident` method. If the given key is not on the local node, use the Vert.x web client to retrieve the incident from the remote node using its IP address:
++
+----
+    @GET
+    @Path("/incident/{id}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response getIncident(@PathParam("id") String id) {
+        Pair<Incident, String> incident = incidentInteractiveQuery.getIncident(id);
+        if (incident == null) {
+            return Response.status(Response.Status.NOT_FOUND.getStatusCode()).build();
+        } else if (incident.getLeft() != null) {
+            return Response.ok(incident.getLeft()).build();
+        } else if (incident.getRight() != null) {
+            WebClient client = WebClient.create(vertx);
+            CompletableFuture<Pair<Incident, Integer>> future = new CompletableFuture<>();
+            client.get(8080, incident.getRight(), "/incident/" + id).send(ar -> {
+                if (ar.succeeded()) {
+                    HttpResponse<Buffer> response = ar.result();
+                    if (response.statusCode() == Response.Status.OK.getStatusCode()) {
+                        Incident i = response.bodyAsJson(Incident.class);
+                        Pair<Incident, Integer> result = new ImmutablePair<>(i, response.statusCode());
+                        future.complete(result);
+                    } else if (response.statusCode() == Response.Status.NOT_FOUND.getStatusCode()) {
+                        log.warn("Incident with key " + id + " not found on remote host " + incident.getRight());
+                        Pair<Incident, Integer> result = new ImmutablePair<>(null, response.statusCode());
+                        future.complete(result);
+                    }
+                } else {
+                    log.error("Cannot retrieve incident with key " + id + " from remote host " + incident.getRight(), ar.cause());
+                    Pair<Incident, Integer> result = new ImmutablePair<>(null, Response.Status.INTERNAL_SERVER_ERROR.getStatusCode());
+                    future.complete(result);
+                }
+            });
+            try {
+                Pair<Incident, Integer> result = future.get(2, TimeUnit.SECONDS);
+                if (result.getRight().equals(Response.Status.OK.getStatusCode())) {
+                    return Response.ok(result.getLeft()).build();
+                } else if (result.getRight().equals(Response.Status.NOT_FOUND.getStatusCode())) {
+                    return Response.status(Response.Status.NOT_FOUND.getStatusCode()).build();
+                } else {
+                    return Response.status(Response.Status.INTERNAL_SERVER_ERROR).build();
+                }
+            } catch (Exception e) {
+                log.error("Exception while waiting for result of remote call", e);
+                return Response.status(Response.Status.INTERNAL_SERVER_ERROR).build();
+            }
+        } else {
+            return Response.status(Response.Status.NOT_FOUND.getStatusCode()).build();
+        }
+    }
+----
+* Notice that the Vert.x web client is asynchronous. As the rest of the code is not, it waits for the `CompletableFuture` to be completed in a blocking call, with a timeout of 2 seconds.
+
+. Patch the incident aggregation service deploymentconfig to use the OpenShift downward API to inject the pod IP address:
++
+----
+$ oc patch dc incident-aggregation-service --type='json' -p '[{"op": "add", "path": "/spec/template/spec/containers/0/env", "value": [{ "name" : "POD_IP", "valueFrom" : { "fieldRef" : { "apiVersion": "v1", "fieldPath": "status.podIP"}}}] }]' -n user1-kafka-streams
+----
+
+. Add the following configuration property to the `incident-aggregation-service` configmap:
++
+----
+quarkus.kafka-streams.application-server=${pod.ip}:8080
+----
++
+This setting is required for the Kafka Streams state store metadata to be able to return the IP address of the pod that hosts the requested key.  
+
+. Deploy the new version of the application. Build the code, create an image and push to OpenShift.
+
+. Scale the incident aggregation service to 2 pods.
+
+. Test the REST endpoint. Expect a 200 response for every request.
