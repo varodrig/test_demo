@@ -1,0 +1,1019 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== State management with Data Grid Lab
+
+.Prerequisites
+* Access to a Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6.x
+
+.Goals
+* Use Red Hat Data Grid to manage state in a distributed application
+* Use Red Hat Data Grid Client in a Quarkus application.
+
+:numbered:
+
+== Introduction
+
+Red Hat Data Grid  is a distributed in-memory key/value data store, give applications a scalable in-memory repository for rapidly changing application data. It uses RAM to store information for rapid, low latency response and very high throughput, and keeps copies of information synced across multiple servers for continuous availability, information reliability, and linear scalability. The most common Data Grid use cases are data caching and transient data storage, but it can also be used a primary NoSQL data store. In addition, applications can perform parallel distributed workload execution, run rich queries and manage transactions. Data Grid can be clustered and scaled out to support large data volumes, making it very well suited for IoT and Big Data solutions.
+
+In this lab you will leverage Data Grid as data store for relatively short-lived data.
+
+The mission service manages the lifecycle of _mission_ entities in the Emergency Response application. A mission represents a responder picking up an group of evacuees (represented by an _incident_ entity) and bringing them to a shelter. +
+The process service matches the incident to a responder and a shelter destination based on a number of criteria like number of evacuees, need for medical help, the boat capacity of the responder and the distance between the responder, the incident and the shelter. Once a suitable match is found, the process service emits a _CreateMissionCommand_ message containing the details of the mission to create - Ids of responder and incident, coordinates of the incident, responder and shelter locations. The mission service creates a mission entity, stores it into a repository, and emits an _MissionStartedEvent_. +
+The responder simulator service consumes the _MissionStartedEvent_ message and starts producing _ResponderLocationUpdate_ events which simulate the movement of the responder towards the evacuees and later the shelter. +
+The _ResponderLocationUpdate_ events are consumed by the mission service, which updates the mission entity and sends out _MissionPickedupEvent_ and _MissionCompletedEvent_ messages. +
+The lifecycle of the mission entity ends when the mission is completed, meaning the responder dropped off the evacuees at the shelter location.
+
+Mission entities have a relatively short lifespan - in the demo typically between 1 and 5 minutes. So a design decision was made not to store them in permanent storage like a database, but to keep them in a in-memory hashmap for the duration of their life cycle. +
+Obviously this simple solution has severe drawbacks when moving to production:
+
+* The application cannot be scaled out.
+* If the application dies, the state is lost and cannot be recovered.
+
+For such situations, a distributed in-memory data store like Red Hat Data Grid is ideal. By storing mission state in Data Grid, the mission service becomes a lot more resilient, and can easily be scaled out.
+
+In this lab you will configure the mission service to use Data Grid as data store for the mission entities managed by the application. You will learn how to integrate a Quarkus application with Data Grid.
+
+Infinispan is the name of the upstream project for Red Hat Data Grid. In the lab both names are used interchangeably. 
+
+== Add Data Grid Client in a Quarkus Application
+
+=== Modify the Application Code to use Data Grid
+
+. Check out the code for the mission service:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/mission-service-data-grid.git
+----
++
+This version of the mission service uses a hash map to store the mission entities.
+
+. Import the code in your IDE of choice.
+
+. Make sure the application builds and the unit tests pass.
++
+----
+$ mvn clean test
+----
+
+. Familiarize yourself with the code.
+* `MissionCommandSource` and `ResponderUpdateLocation` contain the code to process incoming _CreateMissionCommand_ and _ResponderLocationUpdate_ messages, respectively.
+* `Routeplanner` contains the code to interface with the MapBox API. In this version of the application it is mocked out.
+* `EventSink` handles sending _MissionStartedEvent_, _MissionPickedupEvent_, _MissionCompletedEvent_ and _UpdateResponderCommand_ messages.
+* `MissionRepository` handles storing and retrieving mission entities from the in-memory hash map.
+
+. Add a dependency to the `quarkus-infinispan-client` extension to the `pom.xml` file of the project.
++
+----
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-infinispan-client</artifactId>
+    </dependency>
+----
+
+. One of the things the Quarkus Infinispan client provides is a CDI `Producer` for an Infinispan `org.infinispan.client.hotrod.RemoteCacheManager`. This means you can inject an instance of `RemoteCacheManager` in the `MissionRepository` class.
++
+----
+    @Inject
+    RemoteCacheManager cacheManager;
+----
+
+. The `RemoteCacheManager` API allows to create a new remote cache or get an existing remote cache. When creating a new cache, you can pass a cache configuration object for the new cache. +
+Let's say that for the mission service cache, you decide to use a distributed cache with two replicas for each data item. The server expects the configuration as an XML file, so you can use a helper class which extends `org.infinispan.commons.configuration.BasicConfiguration` to build the configuration for the cache. +
+Add the following class to the `com.redhat.emergency.response.repository` package:
++
+----
+public class Configuration implements BasicConfiguration {
+
+    private String name;
+
+    private String mode;
+
+    private Integer owners;
+
+    @Override
+    public String toXMLString(String name) {
+        return "<infinispan><cache-container>"
+                + "<distributed-cache name=\"" + name + "\" "
+                + "mode=\"" + mode + "\" "
+                + "owners=\"" + owners + "\">"
+                + "</distributed-cache>"
+                + "</cache-container></infinispan>";
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    public static class Builder {
+
+        private final Configuration configuration = new Configuration();
+
+        public Builder() {}
+
+        public Builder name(String name) {
+            configuration.name = name;
+            return this;
+        }
+
+        public Builder mode(String mode) {
+            configuration.mode = mode.toUpperCase();
+            return this;
+        }
+
+        public Builder owners(Integer owners) {
+            configuration.owners = owners;
+            return this;
+        }
+
+        public Configuration build() {
+            return configuration;
+        }
+
+    }
+}
+----
+
+. Add a method to `MissionRepository` which returns an instance of the remote cache with the desired configuration, using the `RemoteCacheManager` administration API.
++
+----
+    private RemoteCache<String, String> initCache() {
+        Configuration configuration = Configuration.builder().name("mission").mode("SYNC").owners(2).build();
+        return cacheManager.administration().getOrCreateCache(cacheName, configuration);
+    }
+----
++
+The name of the cache is injected as a configuration property:
++
+----
+    @ConfigProperty(name = "infinispan.cache.name.mission", defaultValue = "mission")
+    String cacheName;
+----
+
+. The remote cache can be created at application startup. In a CDI application you can have a method executed at startup by listening to the `StartupEvent` events emitted by the CDI container after initialization of the CDI beans. Add a property to hold the instance of the cache, and a method that creates the remote cache at startup to the `MissionRepository` class:
++
+----
+    RemoteCache<String, String> missionCache;
+
+    void onStart(@Observes StartupEvent e) {
+        log.info("Creating remote cache '" + cacheName + "'" );
+        missionCache = initCache();
+    }
+----
+
+. At this point you can change the methods in the `MissionRepository` class to use the remote cache instance rather than a hash map. +
+The Data Grid remote cache API extends the Java `Map` API, so the method names are almost the same. +
+However, you need to take into account serialization. Data Grid clients communicate with remote caches through a binary protocol called _HotRod_. The HotRod protocol uses _protobuf_ for serialization and deserialization. Out of the box, without additional configuration it only understands primitives, Strings, Date and Instant, and collections of these. +
+This means you need to transform the Mission entities into for example a JSON string before putting it in the cache. The `Mission` object has a method `toJson` to do this, using the Vert.x JSON API.
+* The `add(Mission)` method now becomes:
++
+----
+    public void add(Mission mission) {
+        missionCache.put(mission.getKey(), mission.toJson());
+    }
+----
+* Modify the other methods - `get()`, `getAll()`, `clear()`, and `getResponderById()` - so that they use the remote cache rather than the hash map. Do not change the method return types. +
+Use `io.vertx.core.json.Json.decodeValue(json, Mission.class)` to deserialize the cached strings to a Mission object. As an example, change the `get` method to:
++
+----
+    public Optional<Mission> get(String key) {
+        return Optional.ofNullable(missionCache.get(key)).map(s -> {
+            Mission mission = null;
+            try {
+                mission = Json.decodeValue(s, Mission.class);
+            } catch (DecodeException e) {
+                log.error("Exception decoding mission with id = " + key, e);
+            }
+            return mission;
+        });
+    }
+----
+* Delete the property for the `repository` hash map.
+
+. Add the following configuration settings for the cache in `src/main/resources/application.properties`:
++
+----
+quarkus.infinispan-client.auth-server-name=infinispan
+quarkus.infinispan-client.auth-realm=default
+quarkus.infinispan-client.sasl-mechanism=DIGEST-MD5
+----
++
+Data Grid has authentication enabled by default, and supports several authentication mechanisms. Here we use username/password based DIGEST-MD5, which is similar to the Digest HTTP mechanism. +
+The URL to access the remote cache and the username/password combination are typically configured at runtime, as they will most probably be different per environment.
+
+. Since version 8.1, Data Grid is configured by default to use SSL when running on OpenShift. On the server side it uses a certificate chain signed by the OpenShift cluster CA. When using SSL, most Java applications and libraries require to create and reference a keystore containing the trusted (root) certificate. With Data Grid things are a little bit easier: the HotRod client can be configured with a path to a certificate in PEM format. The client will build an in-memory keystore containing the certificate found in the designated path. The OpenShift cluster CA certificate is mounted automatically in every pod in a well-defined location. +
+This means that on OpenShift you can enable the Infinispan client with SSL by simply configuring the HotRod client.
++
+Create a file `hotrod-client.properties` in the `src/main/resources/META-INF` folder of the project. Set the contents of the file to:
++
+----
+infinispan.client.hotrod.use_ssl = true
+
+infinispan.client.hotrod.trust_store_path = /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+----
+
+=== Integration Tests
+
+At this point you probably want to write unit tests to validate your code. The issue here is that the Data Grid server cannot readily be mocked out, so you need a running Data Grid server in order to test the code. With technologies like Docker, Podman or Testcontainers this is not such a big deal, but it is still pretty cumbersome, in particular when moving the code to a CI/CD pipeline. +
+
+So let's skip unit tests and move straight away to integration tests. Integration tests run in a different Maven build phase than unit tests, and typically in an environment where external dependencies are available.
+
+. Create a class called `com.redhat.emergency.response.repository.MissionRepositoryIT` in the `src/test/java` folder of the project. 
+. Annotate the test class with `@QuarkusTest`, and inject an instance of `MissionRepository`.
++
+----
+@QuarkusTest
+public class MissionRepositoryIT {
+
+    @Inject
+    MissionRepository missionRepository;
+
+}
+----
+
+. Create a method to test adding and retrieving a Mission instance to the cache. Annotate the method with JUnit `@Test`.
++
+----
+    @Test
+    void testAddAndRetrieveMission() {
+
+        JsonObject json = new JsonObject().put("id", UUID.randomUUID().toString()).put("incidentId", "incident123")
+                .put("incidentLat", new BigDecimal("30.12345").doubleValue()).put("incidentLong", new BigDecimal("-70.98765").doubleValue())
+                .put("responderId", "responder123")
+                .put("responderStartLat", new BigDecimal("31.12345").doubleValue()).put("responderStartLong", new BigDecimal("-71.98765").doubleValue())
+                .put("destinationLat", new BigDecimal("32.12345").doubleValue()).put("destinationLong", new BigDecimal("-72.98765").doubleValue())
+                .put("status", "CREATED").put("responderLocationHistory", new JsonArray().add(new JsonObject().put("lat", new BigDecimal("30.45678").doubleValue())
+                .put("lon", new BigDecimal("-70.65432").doubleValue()).put("timestamp", Instant.now().toEpochMilli())))
+                .put("steps", new JsonArray().add(new JsonObject().put("lat", new BigDecimal("30.14785").doubleValue())
+                .put("lon", new BigDecimal("-70.91546").doubleValue()).put("wayPoint", false).put("destination", false)));
+
+        Mission mission = json.mapTo(Mission.class);
+
+        missionRepository.add(mission);
+
+        Optional<Mission> fromCache = missionRepository.get(mission.getKey());
+
+        MatcherAssert.assertThat(fromCache.isPresent(), Matchers.is(true));
+        MatcherAssert.assertThat(fromCache.get().getId(), Matchers.notNullValue());
+        MatcherAssert.assertThat(fromCache.get().getIncidentId(), Matchers.equalTo("incident123"));
+        MatcherAssert.assertThat(fromCache.get().getIncidentLat(), Matchers.equalTo(new BigDecimal("30.12345")));
+        MatcherAssert.assertThat(fromCache.get().getIncidentLong(), Matchers.equalTo(new BigDecimal("-70.98765")));
+        MatcherAssert.assertThat(fromCache.get().getResponderId(), Matchers.equalTo("responder123"));
+        MatcherAssert.assertThat(fromCache.get().getResponderStartLat(), Matchers.equalTo(new BigDecimal("31.12345")));
+        MatcherAssert.assertThat(fromCache.get().getResponderStartLong(), Matchers.equalTo(new BigDecimal("-71.98765")));
+        MatcherAssert.assertThat(fromCache.get().getDestinationLat(), Matchers.equalTo(new BigDecimal("32.12345")));
+        MatcherAssert.assertThat(fromCache.get().getDestinationLong(), Matchers.equalTo(new BigDecimal("-72.98765")));
+        MatcherAssert.assertThat(fromCache.get().getStatus(), Matchers.equalTo("CREATED"));
+        MatcherAssert.assertThat(fromCache.get().getResponderLocationHistory().size(), Matchers.equalTo(1));
+        MatcherAssert.assertThat(fromCache.get().getSteps().size(), Matchers.equalTo(1));
+
+    }
+----
+. Create tests for the other methods - `getAll`, `getByResponderId`.
+
+. Add the following configuration properties in the `src/test/resources/application.properties` file:
++
+----
+quarkus.infinispan-client.server-list=localhost:11222
+
+# Auth
+quarkus.infinispan-client.auth-server-name=infinispan
+quarkus.infinispan-client.auth-realm=default
+quarkus.infinispan-client.auth-username=demo
+quarkus.infinispan-client.auth-password=demo
+quarkus.infinispan-client.sasl-mechanism=DIGEST-MD5
+----
++
+When a test class annotated with `@QuarkusTest` is run, the test profile is automatically activated in the Quarkus runtime, and the `application.properties` file in the `src/test/resources` folder is loaded.
++
+[IMPORTANT]
+====
+If you are using Docker on a Mac, you need to add `quarkus.infinispan-client.client-intelligence=BASIC` to `src/test/resources/application.properties`
+====
+
+. Create a file `hotrod-client.properties` in the `src/test/resources/META-INF` folder. The contents of the file can remain empty. +
+When running the integration test, the `hotrod-client.properties` file in the `src/test/resources/META-INF` folder will be loaded rather than the file with the same name in the `src/main/resources/META-INF` folder. So in the integration tests SSL will not be enabled. 
+
+. Spin up an instance of Data Grid on your local computer using Podman:
++
+----
+$ sudo podman run -it -p 11222:11222 -e USER="demo" -e PASS="demo" infinispan/server:latest
+----
++
+Note that podman is run as root here. Port forwarding does not work with _rootless_ podman.
++
+.Sample Output
+----
+################################################################################
+#                                                                              #
+# IDENTITIES_PATH not specified                                                #
+# Generating Identities yaml using USER and PASS env vars.                     #
+################################################################################
+2020-07-15 20:46:11,274 INFO  [io.quarkus] (main) config-generator 2.0.0.Final native (powered by Quarkus 1.5.0.Final) started in 0.006s. 
+2020-07-15 20:46:11,274 INFO  [io.quarkus] (main) Profile prod activated. 
+2020-07-15 20:46:11,274 INFO  [io.quarkus] (main) Installed features: [cdi, qute]
+2020-07-15 20:46:11,278 INFO  [io.quarkus] (main) config-generator stopped in 0.000s
+20:46:12,010 INFO  (main) [BOOT] JVM OpenJDK 64-Bit Server VM Oracle Corporation 11.0.7+10-LTS
+20:46:12,018 INFO  (main) [BOOT] JVM arguments = [-server, -XX:+ExitOnOutOfMemoryError, -XX:MetaspaceSize=32m, -XX:MaxMetaspaceSize=96m, -Djava.net.preferIPv4Stack=true, -Djava.awt.headless=true, -Dvisualvm.display.name=infinispan-server, -Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager, -Dinfinispan.server.home.path=/opt/infinispan, -classpath, :/opt/infinispan/boot/infinispan-server-runtime-11.0.0.Final-loader.jar, org.infinispan.server.loader.Loader, org.infinispan.server.Bootstrap]
+20:46:12,019 INFO  (main) [BOOT] PID = 62
+20:46:12,062 INFO  (main) [org.infinispan.SERVER] ISPN080000: Infinispan Server starting
+20:46:12,063 INFO  (main) [org.infinispan.SERVER] ISPN080017: Server configuration: /opt/infinispan/server/conf/infinispan.xml
+20:46:12,063 INFO  (main) [org.infinispan.SERVER] ISPN080032: Logging configuration: /opt/infinispan/server/conf/log4j2.xml
+20:46:12,766 INFO  (main) [org.infinispan.SERVER] ISPN080027: Loaded extension 'query-dsl-filter-converter-factory'
+20:46:12,766 INFO  (main) [org.infinispan.SERVER] ISPN080027: Loaded extension 'continuous-query-filter-converter-factory'
+20:46:12,769 INFO  (main) [org.infinispan.SERVER] ISPN080027: Loaded extension 'iteration-filter-converter-factory'
+20:46:12,770 INFO  (main) [org.infinispan.SERVER] ISPN080027: Loaded extension 'jdk.nashorn.api.scripting.NashornScriptEngineFactory'
+20:46:13,354 WARN  (main) [org.infinispan.PERSISTENCE] ISPN000554: infinispan-boss-marshalling dependency detected, jboss-marshalling has been deprecated and will be removed in the future
+20:46:13,941 INFO  (main) [org.infinispan.CONTAINER] ISPN000128: Infinispan version: Infinispan 'Corona Extra' 11.0.0.Final
+20:46:14,181 INFO  (main) [org.infinispan.CLUSTER] ISPN000078: Starting JGroups channel infinispan with stack image-tcp
+20:46:19,340 INFO  (main) [org.infinispan.CLUSTER] ISPN000094: Received new cluster view for channel infinispan: [a72573ce5ec8-52827|0] (1) [a72573ce5ec8-52827]
+20:46:19,350 INFO  (main) [org.infinispan.CLUSTER] ISPN000079: Channel infinispan local address is a72573ce5ec8-52827, physical addresses are [10.88.0.48:7800]
+20:46:19,381 INFO  (main) [org.infinispan.CONTAINER] ISPN000390: Persisted state, version=11.0.0.Final timestamp=2020-07-15T20:46:19.379281Z
+20:46:19,653 INFO  (main) [org.infinispan.CONTAINER] ISPN000104: Using EmbeddedTransactionManager
+20:46:20,060 INFO  (ForkJoinPool.commonPool-worker-3) [org.infinispan.SERVER] ISPN080018: Protocol HotRod (internal)
+20:46:20,197 INFO  (main) [org.infinispan.SERVER] ISPN080018: Protocol REST (internal)
+20:46:20,347 INFO  (main) [org.infinispan.SERVER] ISPN080004: Protocol SINGLE_PORT listening on 10.88.0.48:11222
+20:46:20,347 INFO  (main) [org.infinispan.SERVER] ISPN080034: Server 'a72573ce5ec8-52827' listening on http://10.88.0.48:11222
+20:46:20,348 INFO  (main) [org.infinispan.SERVER] ISPN080001: Infinispan Server 11.0.0.Final started in 8284ms
+----
+
+. Run the integration test:
++
+----
+$ mvn clean integration-test -DskipUTs=true
+----
++
+`-DskipUTs` will skip the unit tests. Refer to the `pom.xml` file for details how this is set up.
++
+.Sample Output
+----
+[INFO]
+[INFO] --- maven-failsafe-plugin:2.22.1:integration-test (default) @ mission-service-quarkus --- 
+[INFO]
+[INFO] ------------------------------------------------------- 
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running com.redhat.emergency.response.repository.MissionRepositoryIT
+[...]
+2020-07-16 01:19:26,417 INFO  [io.quarkus] (main) Quarkus 1.5.2.Final on JVM started in 3.160s. Listening on: http://0.0.0.0:8081
+2020-07-16 01:19:26,418 INFO  [io.quarkus] (main) Profile test activated. 
+2020-07-16 01:19:26,418 INFO  [io.quarkus] (main) Installed features: [cdi, infinispan-client, mutiny, smallrye-health, smallrye-reactive-messaging, smallrye-reactive-messaging-kafka, vertx, vertx-web]
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 6.375 s - in com.redhat.emergency.response.repository.MissionRepositoryIT
+2020-07-16 01:19:27,141 INFO  [io.sma.rea.mes.ext.MediatorManager] (main) Cancel subscriptions
+2020-07-16 01:19:27,167 INFO  [io.quarkus] (main) Quarkus stopped in 0.038s
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  16.128 s
+[INFO] Finished at: 2020-07-16T01:19:27+02:00
+[INFO] ------------------------------------------------------------------------
+----
+
+=== Reactive and Asynchronous Programming Style
+
+In the mission service, the cache is accessed whenever messages are consumed in the `MissionCommandSource` and the `ResponderUpdateLocationSource` classes. Theses classes use _Reactive Messaging_, and the code is executed on an event loop thread. These threads should never be blocked, so potentially lengthy or blocking operations should be executed asynchronously on a separate thread pool if possible.
+
+Putting and retrieving objects in a Data Grid cache is normally very fast, but as the grid is a remote service, there is always the risk of service degradation where calls to the grid take longer than expected. To protect the mission service from saturating the event loop threads, it is probably a good idea to execute the calls to the Data Grid asynchronously.
+
+There are several ways to achieve this. The Data Grid client API offers an asynchronous API, but we can also use the _Mutiny_ reactive library used in Quarkus.
+
+. In the `MissionService`, change the `add` method to return a Mutiny `Uni<Void>` instance rather `void`:
++
+----
+    public Uni<Void> add(Mission mission) {
+
+       return Uni.createFrom().<Void>item(() -> {
+            missionCache.put(mission.getKey(), mission.toJson());
+            return null;
+        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+----
++
+This code creates a `Uni` that will emit an item when the call to `missionCache.put()` returns. The `runSubscriptionOn` means that the subscription will execute on a thread from `Infrastructure.getDefaultWorkerPool()`, which is the default worker pool created by the Quarkus runtime at startup.
+
+. Make similar changes for the other cache methods. So method signatures become:
+* `public Uni<Void> add(Mission mission)`
+* `public Uni<Optional<Mission>> get(String key)`
+* `public Uni<List<Mission>> getAll()`
+* `public Uni<Void> clear()`
+
+. Next step is to fix the code that calls the `MissionRepository` methods, in the `ResponderUpdateLocationSource`, `RestApi` and `MissionCommandSource` classes.
+* In the `MissionCommandSource` class, change the `addToRepository` method as follows:
++
+----
+    private Uni<Mission> addToRepository(Mission mission) {
+        return repository.add(mission).map(v -> mission);
+    }
+----
++ 
+Change the `process` method. Notice the change from `.onItem().transform(this::addToRepository)` to `.onItem().transformToUni(this::addToRepository)`:
++
+----
+    @Incoming("mission-command")
+    @Acknowledgment(Acknowledgment.Strategy.MANUAL)
+    public Uni<CompletionStage<Void>> process(Message<String> missionCommandMessage) {
+
+        return Uni.createFrom().item(missionCommandMessage)
+                .onItem().transform(mcm -> accept(missionCommandMessage.getPayload()))
+                .onItem().transform(o -> o.flatMap(j -> validate(j.getJsonObject("body"))).orElseThrow(() -> new IllegalStateException("Message ignored")))
+                .onItem().transform(m -> m.status(MissionStatus.CREATED))
+                .onItem().transform(this::addRoute)
+                .onItem().transformToUni(this::addToRepository)
+                .onItem().transformToUni(this::publishMissionStartedEventAsync)
+                .onItem().transform(m -> missionCommandMessage.ack())
+                .onFailure().recoverWithItem(t -> missionCommandMessage.ack());
+    }
+----
+* In the `ResponderUpdateLocationSource` class, modify the `processLocationUpdate` method:
++
+----
+    private Uni<Void> processLocationUpdate(JsonObject locationUpdate) {
+        return repository.get(getKey(locationUpdate)).flatMap(mission -> {
+            if (mission.isPresent()) {
+                ResponderLocationHistory rlh = new ResponderLocationHistory(BigDecimal.valueOf(locationUpdate.getDouble("lat")),
+                        BigDecimal.valueOf(locationUpdate.getDouble("lon")), Instant.now().toEpochMilli());
+                mission.get().getResponderLocationHistory().add(rlh);
+                return emitMissionEvent(locationUpdate.getString("status"), mission.get())
+                        .onItem().transformToUni(m -> emitUpdateResponderCommand(m, locationUpdate))
+                        .onItem().transformToUni(m -> repository.add(m));
+            } else {
+                log.warn("Mission with key = " + getKey(locationUpdate) + " not found in the repository.");
+                return Uni.createFrom().item(null);
+            }
+        });
+    }
+----
+* In the `RestApi` class, change the `allMissions` method to:
++
+----
+    @Route(path = "/api/missions", methods = HttpMethod.GET, produces = "application/json")
+    void allMissions(RoutingExchange ex) {
+        repository.getAll().subscribe().with(missions -> ex.response().putHeader("Content-Type", "application/json")
+                .setStatusCode(200).end(Json.encode(missions)));
+    }
+----
++
+Make similar changes to the other methods.
+
+. At this point the code of the mission service should compile again:
++
+----
+$ mvn clean compile
+----
+
+. Fix the test classes for the project:
+* In the `MissionCommandSourceTest`, add the following _Mockito_ mock setup statement to the `testProcessMessage` method, just after the other Mockito `when` statements:
++
+----
+when(repository.add(any(Mission.class))).thenReturn(Uni.createFrom().nullItem());
+----
+* In the `ResponderUpdateLocationSourceTest` class, change the return type for the Mockito setup methods to an `Uni`.
++
+----
+when(repository.get("5d9b2d3a-136f-414f-96ba-1b2a445fee5d:64")).thenReturn(Uni.createFrom().item(() -> Optional.of(mission)));
+----
+* In the same class, add the following Mockito statement to the `testProcessMessage`, `testProcessMessagePickedUp`, `testProcessMessageDropped` methods, just after the other Mockito `when` statements:
++
+----
+when(repository.add(any(Mission.class))).thenReturn(Uni.createFrom().nullItem());
+----
+* In the `RestApiTest` class, change the return types of the calls to the mocked repository:
++
+----
+when(repository.getAll()).thenReturn(Uni.createFrom().item(() -> Arrays.asList(mission1, mission2)));
+----
+* Still in the `RestApiTest` class, add the following Mockito statement to the `testClear` method:
++
+----
+when(repository.clear()).thenReturn(Uni.createFrom().nullItem());
+----
+* In the `MissionRepositoryIT` class:
+** Change all occurrences of `missionRepository.add(mission)` to `missionRepository.add(mission).await().indefinitely()`.
++
+`awaits()` awaits (blocking the caller thread) until the item or a failure is emitted by the observed Uni.
+** Change all occurrences of `missionRepository.get(mission.getKey())` to `missionRepository.get(mission.getKey()).await().indefinitely()`.
+** Change all occurrences of `missionRepository.getAll()` to `missionRepository.getAll().await().indefinitely()`.
+** Change all occurrences of `missionRepository.getByResponderId()` to `missionRepository.getByResponderId().await().indefinitely()`. 
+
+. Run the unit tests. All the tests should succeed.
++
+----
+$ mvn clean test
+----
++
+NOTE: the unit tests require a running instance of Data Grid. Please refer to the last section of this lab how to work around this requirement.
+
+. Run the integration test. Expect the test to succeed.
++
+----
+$ mvn clean integration-test -DskipUTs=true
+----
+
+=== Deploy and Test
+
+Now that the implementation is finished and the unit and integration tests succeed, it is time to deploy the mission service in a test environment. 
+
+. Make sure you are logged in the OpenShift cluster as a user with admin privileges.
+. Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file:
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+
+. Deploy the AMQ Streams operator:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=datagrid
+----
++
+This command deploys the AMQ Streams operator in the `user1-datagrid` namespace. The scope of the operator is the namespace itself.
+
+. Deploy the AMQ Streams cluster:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=datagrid -e zookeeper_storage_type=ephemeral -e kafka_storage_type=ephemeral
+----
++
+This command deploys a Kafka cluster consisting of 3 ZooKeeper nodes and 3 Kafka broker nodes in the `user1-datagrid` namespace. Both Zookeeper and the Kafka brokers use ephemeral storage - which is perfectly acceptable in a short-lived development environment. 
+
+. Deploy the Kafka topics:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=datagrid
+----
++
+This command deploys the Kafka topics used by the Emergency Response application. Every topic is created with 15 partitions and a replication factor of 3.
+
+. Deploy the Data Grid cluster:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/datagrid.yml -e project_admin=user1 -e project_name=datagrid
+----
++
+This command deploys a three-node Data Grid cluster using the Data Grid operator. The Data Grid cluster is deployed as a StatefulSet. It is configured for username/password authentication, and SSL. Credentials are stored in the `dg-connect-secret` secret. The server certificate is stored in the `datagrid-tls-secret` secret.
+
+. Deploy the Kafka producer app, a simple Quarkus application that exposes a REST endpoint and sends the payload of the REST call as a Kafka message to a given topic. You use this app to send messages to the `topic-mission-command` topic, which is the topic the mission service consumes _CreateMessageCommand_ messages from. +
+Deploy the Kafka producer application:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_producer_app.yml -e project_admin=user1 -e project_name=datagrid -e kafka_topic=topic-mission-command
+----
+
+. Create a file called `application.properties` to hold the externalized configuration for the mission service.
++
+----
+$ echo '
+quarkus.log.console.level=DEBUG
+quarkus.log.category."com.redhat.emergency.response".level=DEBUG
+
+quarkus.infinispan-client.server-list=datagrid-service.user1-datagrid.svc:11222
+quarkus.infinispan-client.auth-username=demo
+quarkus.infinispan-client.auth-password=demo
+
+infinispan.cache.name.mission=mission
+
+kafka.bootstrap.servers=kafka-cluster-kafka-bootstrap.user1-datagrid.svc:9092
+
+mp.messaging.incoming.mission-command.topic=topic-mission-command
+mp.messaging.incoming.mission-command.group.id=mission-service
+
+mp.messaging.incoming.responder-location-update.topic=topic-responder-location-update
+mp.messaging.incoming.responder-location-update.group.id=mission-service
+
+mp.messaging.outgoing.mission-event.topic=topic-mission-event
+mp.messaging.outgoing.responder-command.topic=topic-responder-command
+' | tee /tmp/application.properties
+----
++
+Notice the `quarkus.infinispan-client.server-list` property, which points to the service of the Data Grid StatefulSet.
+
+. Create the configmap for the mission service:
++
+----
+$ oc create configmap mission-service --from-file=/tmp/application.properties -n user1-datagrid
+----
+
+. Create a deploymentconfig for the mission service application:
++
+----
+$ echo '
+apiVersion: apps.openshift.io/v1
+kind: DeploymentConfig
+metadata:
+  labels:
+    app: mission-service
+  name: mission-service
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    app: mission-service
+    group: erd-services
+  strategy:
+    activeDeadlineSeconds: 21600
+    resources: {}
+    rollingParams:
+      intervalSeconds: 1
+      maxSurge: 25%
+      maxUnavailable: 25%
+      timeoutSeconds: 3600
+      updatePeriodSeconds: 1
+    type: Rolling
+  template:
+    metadata:
+      labels:
+        app: mission-service
+        group: erd-services
+    spec:
+      containers:
+      - env:
+        - name: KUBERNETES_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        name: mission-service
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 3
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: 250m
+            memory: 250Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /deployments/config
+          name: config
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - configMap:
+          defaultMode: 420
+          name: mission-service
+        name: config
+  triggers:
+  - type: ConfigChange
+  - imageChangeParams:
+      automatic: true
+      containerNames:
+      - mission-service
+      from:
+        kind: ImageStreamTag
+        name: mission-service:latest
+    type: ImageChange
+' | oc create -f - -n user1-datagrid
+----
+
+. Build the mission service application, create an image and push to the OpenShift cluster:
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-datagrid/mission-service:latest .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-datagrid/mission-service:latest
+----
++
+This triggers a deployment of the mission service.
+
+. Check the logs of the mission service pod, and verify that the pod successfully connected to the Data Grid cluster and created the remote cache:
++
+----
+2020-07-17 07:58:15,107 INFO  [com.red.eme.res.rep.MissionRepository] (main) Creating remote cache
+2020-07-17 07:58:15,670 INFO  [org.inf.HOTROD] (HotRod-client-async-pool-1-2) ISPN004006: Server sent new topology view (id=9, age=0) containing 3 addresses: [10.128.3.124:11222, 10.131.0.219:11222, 10.131.0.220:11222]
+2020-07-17 07:58:15,671 INFO  [org.inf.HOTROD] (HotRod-client-async-pool-1-2) ISPN004014: New server added(10.128.3.124:11222), adding to the pool.
+2020-07-17 07:58:15,671 INFO  [org.inf.HOTROD] (HotRod-client-async-pool-1-2) ISPN004014: New server added(10.131.0.219:11222), adding to the pool.
+2020-07-17 07:58:15,671 INFO  [org.inf.HOTROD] (HotRod-client-async-pool-1-2) ISPN004014: New server added(10.131.0.220:11222), adding to the pool.
+2020-07-17 07:58:15,671 INFO  [org.inf.HOTROD] (HotRod-client-async-pool-1-2) ISPN004016: Server not in cluster anymore(datagrid-service.user1-datagrid.svc:11222), removing from the pool.
+----
+
+. Create a service for the mission service, and expose the service through an OpenShift route:
++
+----
+$ echo '
+apiVersion: v1
+kind: Service
+metadata:
+  name: mission-service
+spec:
+  ports:
+  - name: http
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: mission-service
+    group: erd-services
+' | oc create -f - -n user1-datagrid
+$ oc expose service mission-service -n user1-datagrid
+----
+
+. To test the application, send a _CreateMissionCommand_ message to the `topic-mission-command` using the Kafka producer app.
++
+----
+$ echo '
+{
+    "key":"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43",
+    "value":{
+      "messageType" : "CreateMissionCommand",
+      "id":"4a6d9a14-5de6-4f04-9125-85819c4824b0",
+      "invokingService":"test",
+      "timestamp":1521148332397,
+      "body": {
+        "incidentId": "829fce70-83ae-49dd-b0dc-6dfbdfd7dc43",
+        "responderId": "responder123",
+        "responderStartLat": "31.12345",
+        "responderStartLong": "-71.98765",
+        "incidentLat": "30.12345",
+        "incidentLong": "-70.98765",
+        "destinationLat": "32.12345",
+        "destinationLong": "-72.98765",
+        "processId": "1"
+    }
+  }
+}
+' | tee /tmp/create-mission.json
+$ KAFKA_PRODUCER_APP=http://$(oc get route kafka-producer-app -n user1-datagrid --template='{{ .spec.host }}')
+$ curl -v -X POST -H "Content-type: application/json" -d @/tmp/create-mission.json ${KAFKA_PRODUCER_APP}/produce
+----
+
+. Use the REST API of the mission service to get the mission entity created by sending the _CreateMissionCommand_ message. The mission entity is retrieved from the remote cache.
++
+----
+$ MISSION_SERVICE_URL=http://$(oc get route mission-service -n user1-datagrid --template='{{ .spec.host }}')
+$ curl -v $MISSION_SERVICE_URL/api/missions
+----
++
+.Sample Output
+----
+*   Trying 35.158.5.133:80...
+* Connected to mission-service-user1-datagrid.apps.cluster-03b3.03b3.example.opentlc.com (35.158.5.133) port 80 (#0)
+> GET /api/missions HTTP/1.1
+> Host: mission-service-user1-datagrid.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< content-type: application/json
+< content-length: 350
+< set-cookie: 2d6727153890519dd6a0a06744d2758a=32d5c18328012c17b482b544dc31ecb9; path=/; HttpOnly
+< cache-control: private
+< 
+* Connection #0 to host mission-service-user1-datagrid.apps.cluster-03b3.03b3.example.opentlc.com left intact
+[{"id":"a08a2a0a-0b70-4630-b64c-60dd99751c7c","incidentId":"829fce70-83ae-49dd-b0dc-6dfbdfd7dc43","responderId":"responder123","responderStartLat":31.12345,"responderStartLong":-71.98765,"incidentLat":30.12345,"incidentLong":-70.98765,"destinationLat":32.12345,"destinationLong":-72.98765,"responderLocationHistory":[],"status":"CREATED","steps":[]}]
+----
+
+. Feel free to experiment with the mission service set up:
+* Scale down and back up the mission service, and verify you can still retrieve the mission entity from the cache.
+* Scale up the mission service, and verify you can retrieve the mission entity from all the nodes.
+* Kill a node from the Data Grid cluster and see what happens. Are you still able to put and retrieve missions from the cache?
++
+NOTE: If you want to create more mission entities by sending _CreateMissionCommand_ messages, make sure every mission has a unique combination of `incidentId` and `responderId`, as a combination of both is used as the key when inserting and retrieving from the cache.
+
+=== Optional: Remove the Dependency on Infinispan Cluster for Unit Tests
+
+The integration tests you wrote for the `MissionRepository` class interact directly with Data Grid, and so require a running Data Grid cluster. But since the integration of the Data Grid client in the application, the unit tests now also require a running Data Grid cluster.
+
+. Shut down the Data Grid container.
+. Run the unit tests for the mission service application.
++
+----
+$ mvn clean test
+----
++
+.Sample Output
+----
+[INFO]
+[INFO] --- maven-surefire-plugin:2.22.1:test (default-test) @ mission-service-quarkus ---
+[INFO]
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running com.redhat.emergency.response.sink.EventSinkTest
+[...]
+2020-07-16 11:41:11,909 INFO  [org.inf.HOTROD] (main) ISPN004021: Infinispan version: Infinispan 'Turia' 10.1.5.Final                                                                   
+2020-07-16 11:41:12,181 ERROR [org.inf.HOTROD] (HotRod-client-async-pool-1-7) ISPN004007: Exception encountered. Retry 10 out of 10: io.netty.channel.AbstractChannel$AnnotatedConnectEx
+ception: finishConnect(..) failed: Connection refused: localhost/127.0.0.1:11222                                                                                                        
+Caused by: java.net.ConnectException: finishConnect(..) failed: Connection refused
+        at io.netty.channel.unix.Errors.throwConnectException(Errors.java:124)
+        at io.netty.channel.unix.Socket.finishConnect(Socket.java:243)
+        at io.netty.channel.epoll.AbstractEpollChannel$AbstractEpollUnsafe.doFinishConnect(AbstractEpollChannel.java:672)
+        at io.netty.channel.epoll.AbstractEpollChannel$AbstractEpollUnsafe.finishConnect(AbstractEpollChannel.java:649)
+        at io.netty.channel.epoll.AbstractEpollChannel$AbstractEpollUnsafe.epollOutReady(AbstractEpollChannel.java:529)
+        at io.netty.channel.epoll.EpollEventLoop.processReady(EpollEventLoop.java:465)
+        at io.netty.channel.epoll.EpollEventLoop.run(EpollEventLoop.java:378)
+        at io.netty.util.concurrent.SingleThreadEventExecutor$4.run(SingleThreadEventExecutor.                                                                                 
+        at io.netty.util.internal.ThreadExecutorMap$2.run(ThreadExecutorMap.java:74)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+        at java.base/java.lang.Thread.run(Thread.java:834)
+[...]
+[INFO] Running com.redhat.emergency.response.source.MessageCommandSourceTest
+[WARNING] Tests run: 3, Failures: 0, Errors: 0, Skipped: 3, Time elapsed: 0.001 s - in com.redhat.emergency.response.source.MessageCommandSourceTest
+[INFO] Running com.redhat.emergency.response.source.ResponderUpdateLocationSourceTest
+[WARNING] Tests run: 4, Failures: 0, Errors: 0, Skipped: 4, Time elapsed: 0.001 s - in com.redhat.emergency.response.source.ResponderUpdateLocationSourceTest
+[INFO] Running com.redhat.emergency.response.model.MissionTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.249 s - in com.redhat.emergency.response.model.MissionTest
+[INFO] Running com.redhat.emergency.response.rest.RestApiTest
+[WARNING] Tests run: 5, Failures: 0, Errors: 0, Skipped: 5, Time elapsed: 0.002 s - in com.redhat.emergency.response.rest.RestApiTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[ERROR] Errors: 
+[ERROR]   EventSinkTest.testResponderCommand » Runtime java.lang.RuntimeException: Faile...
+[INFO] 
+[ERROR] Tests run: 19, Failures: 0, Errors: 1, Skipped: 16
+[INFO] 
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD FAILURE
+[INFO] ------------------------------------------------------------------------
+----
+
+Despite the fact that the unit tests use a mocked version of `MissionRepository`, it seems the tests still try to establish a connection to the Data Grid instance on `localhost:11222`. +
+The root cause lies in the nature of Quarkus and the underlying CDI technology. Tests annotated with `@QuarkusTest` bootstrap the Quarkus runtime. This includes initializing all the CDI beans, even if they are not really used inside the test class. When the `MissionRepository` bean is initialized, the `initCache` method is called, which tries to create the `mission` cache on the Data Grid cluster.
+
+One possible solution to this is to use lazy loading of the Data Grid initialization, so that the cache is only created when first invoked. You can even use a flag to turn lazy initialization on or off. 
+
+. In the `MissionRepository` class, add the `lazy` configuration property:
++
+----
+    @ConfigProperty(name = "infinispan.cache.create.lazy", defaultValue = "false")
+    boolean lazy;
+----
+. Modify the `onStart` method to only initialize the cache if `lazy` is false:
++
+----
+    void onStart(@Observes StartupEvent e) {
+        // do not initialize the cache at startup when remote cache is not available, e.g. in QuarkusTests
+        if (!lazy) {
+            log.info("Creating remote cache");
+            missionCache = initCache();
+        }
+    }
+----
+
+. Add a method `getCache` to obtain an instance of the cache if it does not yet exist:
++
+----
+    private RemoteCache<String, String> getCache() {
+        RemoteCache<String, String> cache = missionCache;
+        if (cache == null) {
+            synchronized(this) {
+                if (missionCache == null) {
+                    missionCache = cache = initCache();
+                }
+            }
+        }
+        return cache;
+    }
+----
++
+This code fragment uses the _double-check idiom_ as described by Joshua Bloch in his excellent _Effective Java_ book. 
+. The _double-check idiom_ pattern requires the `cache` field to be declared `volatile`:
++
+----
+    volatile RemoteCache<String, String> missionCache;
+----
+. Finally replace all direct access points to `missionCache` with a call to `getCache`. For example in the `add` method:
++
+----
+    public void add(Mission mission) {
+        getCache().put(mission.getKey(), mission.toJson());
+    }
+----
+. Add the following configuration to `src/test/resources/application.properties` to set `lazy` to true when running tests:
++
+----
+infinispan.cache.create.lazy=true
+----
+
+. So now you expect the unit tests to succeed even without Data Grid running, as the remote cache will not be initialized when the `MissionRepository` bean is initialized. +
+Run the unit tests again:
++
+----
+$ mvn clean test
+----
++
+Expect the tests to still fail. When looking at the test log output, you still see failed connection attempts to the Data Grid instance.
+
+It turns out the root cause for this behavior lies within runtime initialization of the Quarkus Data Grid client extension: when initializing the Data Grid HotRod client with _protobuf_ marshalling - which is the default - the HotRod client tries to put its protobuf definition files in the cache. +
+The workaround consists in configuring the HotRod client with a mock marshaller in the Quarkus test profile, but only for unit tests.
+
+. Create a class `MockMarshaller` which implements `org.infinispan.commons.marshall.Marshaller` in the `com.redhat.emergency.response.repository` package in `src/test/java`. The marshaller wraps and delegates to an instance of `ProtoStreamMarshaller`.
++
+----
+public class MockMarshaller implements Marshaller {
+
+    private Marshaller delegate = new ProtoStreamMarshaller();
+
+    @Override
+    public byte[] objectToByteBuffer(Object obj, int estimatedSize) throws IOException, InterruptedException {
+        return delegate.objectToByteBuffer(obj, estimatedSize);
+    }
+
+    @Override
+    public byte[] objectToByteBuffer(Object obj) throws IOException, InterruptedException {
+        return delegate.objectToByteBuffer(obj);
+    }
+
+    @Override
+    public Object objectFromByteBuffer(byte[] buf) throws IOException, ClassNotFoundException {
+        return delegate.objectFromByteBuffer(buf);
+    }
+
+    @Override
+    public Object objectFromByteBuffer(byte[] buf, int offset, int length) throws IOException, ClassNotFoundException {
+        return delegate.objectFromByteBuffer(buf, offset, length);
+    }
+
+    @Override
+    public ByteBuffer objectToBuffer(Object o) throws IOException, InterruptedException {
+        return delegate.objectToBuffer(o);
+    }
+
+    @Override
+    public boolean isMarshallable(Object o) throws Exception {
+        return delegate.isMarshallable(o);
+    }
+
+    @Override
+    public BufferSizePredictor getBufferSizePredictor(Object o) {
+        return delegate.getBufferSizePredictor(o);
+    }
+
+    @Override
+    public MediaType mediaType() {
+        return delegate.mediaType();
+    }
+}
+----
+. Add the following configuration to the `hotrod-client.properties` file in the `src/test/resources/META-INF` folder:
++
+----
+infinispan.client.hotrod.marshaller=com.redhat.emergency.response.repository.MockMarshaller
+----
+
+. With those settings the unit tests succeed without requiring a running Data Grid instance. The integration tests also use the `MockMarshaller`, but serialization and deserialization operations delegate to the default _protobuf_ marshaller.
+
+== Tear down the test environment
+
+In order to free up resources on the OpenShift cluster, you can tear down the environment you deployed for this lab. +
+To do so, execute the following Ansible commands:
+
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_producer_app.yml -e project_admin=user1 -e project_name=datagrid -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/mission_service.yml -e project_admin=user1 -e project_name=datagrid -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=datagrid -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=datagrid -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=datagrid -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/datagrid.yml -e project_admin=user1 -e project_name=datagrid -e ACTION=uninstall
+----

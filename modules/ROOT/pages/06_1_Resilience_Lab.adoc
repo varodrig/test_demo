@@ -1,0 +1,1363 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== Resiliency Lab
+
+.Prerequisites
+* Access to the Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6.x
+
+:numbered:
+
+== Introduction
+
+When building distributed cloud-native applications, it is increasingly important to build resilient or fault tolerant services. Failures are inevitable in a distributed system which rely heavily on the network, which is unreliable by definition, and hence you need to embrace failures. The goal is to avoid that one failing service brings down the whole system.
+
+Making a system more resilient and fault-tolerant boils means following a number of design principles:
+
+* Avoid cascading failures
+* Avoid single points of failure
+* Handle failures gracefully and allow for fast degradation
+* Design for failure
+
+Popular strategies and design patterns for resilience include retry policies, handling of timeouts, circuit breakers and bulkheads.
+
+Quarkus is integrated with MicroProfile Fault Tolerance, which specifies a number of fault mitigation strategies focusing on the following aspects:
+
+* Timeout: Define a duration for timeout
+* Retry: Define a criteria on when to retry
+* Fallback: provide an alternative solution for a failed execution.
+* Circuit Breaker: offer a way of fail fast by automatically failing execution to prevent the system overloading and indefinite wait or timeout by the clients.
+* Bulkhead: isolate failures in part of the system while the rest part of the system can still function.
+
+MicroProfile Fault Tolerance defines a number of annotations that can be added to classes and methods and which at runtime will generate interceptor bindings around the annotated methods in order to implement policies around retry, timeout handling, circuit breaker and bulkhead.
+
+== Add Resilience Features to a Quarkus Application
+
+=== Run the Incident Finder Service in Development Mode
+
+In this lab you apply the different MicroProfile Fault Tolerance policies to the incident finder service. The incident finder service allows to lookup incidents by the name of the incident reporter and display aggregated information about the matching incidents. The implementation used in this lab calls the incident service to get a list of incidents for a given name, and then calls the mission service and the disaster service to enrich the incident data with data from these two services.
+
+. Check out the source code of the incident finder service from the course repository on GitHub:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/incident-finder-service-resilience.git
+$ cd incident-finder-service-resilience
+----
+. Import the code into your IDE of choice.
+. Ensure the code builds successfully:
++
+----
+$ mvn clean package
+----
+. Familiarize yourself with the code. The incident finder service is implemented using Quarkus. Some classes of interest include:
+* `IncidentServiceClient`, `MissionServiceClient`, `ShelterServiceClient`: MicroProfile Rest Client interfaces. +
+MicroProfile Rest Client provides a type-safe approach to invoke RESTful services over HTTP. It allows to define RESTful services as JAX-RS annotated interfaces from which a proxy is generated at build time by Quarkus. Notice the `@RegisterRestClient` annotation which qualifies the interface as a MicroProfile REST Client.
+* `IncidentService`, `MissionService`, `ShelterService`: service classes which invoke the rest clients. Notice the `@RestClient` annotation at the injection point.
+* `IncidentResource`: The REST API implementation class, which leverages Quarkus reactive JAX-RS resources.
+
+. Run the incident finder application on your workstation using Quarkus _development mode_.
++
+[NOTE]
+====
+Quarkus _development mode_ enables hot deployment with background compilation, which means that when you modify your Java files and/or your resource files and call the application, these changes will automatically take effect. This allows for very quick turnaround during the development cycle. In this lab you leverage development mode to quickly see the effects of the different MicroProfile Fault Tolerance annotations on the application behavior.
+====
++
+The instructions take the assumption that you have the Emergency Response application deployed in the `user1-er-demo` OpenShift namespace. If the namespace is different, adapt the instructions accordingly.
++
+* Ensure that the incident service, mission service and disaster service of the Emergency Response application in the `user1-er-demo` are exposed with a route. If this is not the case, execute the following commands:
++
+----
+$ oc expose service incident-service -n user1-er-demo
+$ oc expose service mission-service -n user1-er-demo
+$ oc expose service disaster-service -n user1-er-demo
+----
+* In a terminal window, change directory to the root folder of the incident finder service project.
+* Get the URL to the OpenShift application domain:
++
+----
+$ echo $(oc whoami --show-console | sed s#https://console-openshift-console\.##)
+----
+* Create a file named `.env` in the root of the project. Set the contents of the file to the following - set the value of `OCP_APP_DOMAIN` to the output of the previous command.
++
+----
+OCP_APP_DOMAIN=
+INCIDENTS_MP_REST_URL=http://incident-service-user1-er-demo.${OCP_APP_DOMAIN}
+MISSIONS_MP_REST_URL=http://mission-service-user1-er-demo.${OCP_APP_DOMAIN}
+SHELTERS_MP_REST_URL=http://disaster-service-user1-er-demo.${OCP_APP_DOMAIN}
+----
+* Run the incident finder application in development mode:
++
+----
+$ mvn quarkus:dev
+----
++
+.Output
+----
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] --< com.redhat.emergency.response:incident-finder-service-resilience >--
+[INFO] Building incident-finder-service-resilience 1.0.0-SNAPSHOT
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- quarkus-maven-plugin:1.5.2.Final:dev (default-cli) @ incident-finder-service-resilience ---
+[INFO] Nothing to compile - all classes are up to date
+Listening for transport dt_socket at address: 5005
+__  ____  __  _____   ___  __ ____  ______ 
+ --/ __ \/ / / / _ | / _ \/ //_/ / / / __/ 
+ -/ /_/ / /_/ / __ |/ , _/ ,< / /_/ /\ \   
+--\___\_\____/_/ |_/_/|_/_/|_|\____/___/   
+2020-08-04 11:09:02,754 INFO  [io.quarkus] (Quarkus Main Thread) incident-finder-service-resilience 1.0.0-SNAPSHOT on JVM (powered by Quarkus 1.5.2.Final) started in 1.089s. Listening on: http://0.0.0.0:8080
+2020-08-04 11:09:02,775 INFO  [io.quarkus] (Quarkus Main Thread) Profile dev activated. Live Coding activated.
+2020-08-04 11:09:02,775 INFO  [io.quarkus] (Quarkus Main Thread) Installed features: [cdi, mutiny, rest-client, resteasy, resteasy-mutiny, smallrye-health, vertx]
+
+----
+
+. Test the application. Open another terminal window, and execute the following command:
++
+----
+$ curl localhost:8080/incidents?name="jones"
+----
++
+.Sample output
+----
+[{"id":"43e24efe-aab2-41c3-966d-6fc24f5fdb34","lat":"34.17552","lon":"-77.87287","medicalNeeded":true,"numberOfPeople":3,"victimName":"Theodore Jones","victimPhoneNumber":"(336) 555-8016","status":"RESCUED","timestamp":1596483630894,"destinationLat":34.1706,"destinationLon":null,"destinationName":"Wilmington Marine Center","currentPositionLat":34.1707,"currentPositionLon":-77.9484}]
+----
++
+If the curl command returns an empty array, check the existing incidents with a call to the incident service and pick a name of one of the returned incidents:
++
+----
+$ curl http://$(oc get route incident-service -n user1-er-demo --template='{{ .spec.host }}')/incidents
+----
++
+If the call to the incident service returns an empty array, open the Emergency Response console in a browser, log in as _incident_commander_ and run a simulation.
+
+=== Deploy an Envoy Proxy to the Mission Service
+
+In order to experience how the different MicroProfile Fault Tolerance annotations work, you need to be able to simulate failing or slow services. +
+In this lab, you use Envoy for this. Envoy is an open source edge and service proxy, which is used as a proxy in Service Mesh. Envoy proxies the traffic to the target service, and can manipulate that traffic. One of the things Envoy allows you to do is to inject errors or delays, providing an easy way to test that your applications behave as expected when upstream applications fail or become slow. +
+
+. Create an OpenShift project for the Envoy proxy.
++
+----
+$ oc new-project user1-resilience
+----
+
+. Create a configmap with the Envoy static configuration.
++
+----
+$ echo '
+static_resources:
+  listeners:
+  - address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.config.filter.network.http_connection_manager.v2.HttpConnectionManager
+          codec_type: auto
+          stat_prefix: ingress_http
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: service
+              domains:
+              - "*"
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: mission_service
+          access_log:
+          - name: envoy.access_loggers.file
+            config:
+              path: "/dev/stdout"          
+          http_filters:
+          - name: envoy.filters.http.fault
+            typed_config:
+              "@type": type.googleapis.com/envoy.config.filter.http.fault.v2.HTTPFault
+              abort:
+                http_status: 503
+                percentage:
+                  numerator: 0
+                  denominator: HUNDRED
+              delay:
+                fixed_delay: 3s
+                percentage:
+                  numerator: 0
+                  denominator: HUNDRED
+          - name: envoy.filters.http.router
+            typed_config: {}
+  clusters:
+  - name: mission_service
+    connect_timeout: 0.50s
+    type: strict_dns
+    lb_policy: round_robin
+    load_assignment:
+      cluster_name: local_service
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: mission-service.user1-er-demo.svc
+                port_value: 8080
+admin:
+  access_log_path: "/dev/null"
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 8081
+runtime:
+  symlink_root: /srv/runtime/current
+  subdirectory: envoy
+' | tee /tmp/envoy-standalone.yaml
+$ oc create configmap envoy-standalone -n user1-resilience --from-file=envoy.yaml=/tmp/envoy-standalone.yaml
+----
++
+This configures the Envoy as a proxy to the mission service, and configures the _HTTP Fault_ Envoy filter, which allows to set errors and delays. The proxy itself is listening to port 8080.
+
+. Deploy the Envoy proxy in the `user1-resilience` namespace:
++
+----
+$ echo '
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: envoy
+  labels:
+    app: envoy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: envoy-proxy
+      envoy/kind: envoy-standalone
+  template:
+    metadata:
+      labels:
+        name: envoy-proxy
+        envoy/kind: envoy-standalone
+    spec:
+      containers:
+        - resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          terminationMessagePath: /dev/termination-log
+          name: envoy-proxy
+          imagePullPolicy: Always
+          terminationMessagePolicy: File
+          image: "quay.io/btison/envoy-fault-injection:latest"
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext: {}
+      schedulerName: default-scheduler
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: envoy-standalone
+            defaultMode: 420
+  strategy:
+    type: Recreate
+' | oc create -f - -n user1-resilience
+----
++
+.Output
+----
+deployment.apps/envoy created
+----
+
+. Expose the Envoy proxy as service and route.
+----
+$ oc expose deployment envoy --port 8080 -n user1-resilience
+$ oc expose service envoy -n user1-resilience
+----
+
+. Test the envoy proxy. Expect a HTTP `200 OK` return code, and the list of missions in the response body.
++
+----
+$ ENVOY_URL=http://$(oc get route envoy -n user1-resilience --template='{{ .spec.host }}')
+$ curl -v -X GET $ENVOY_URL/api/missions
+----
++
+.Sample Output
+----
+Note: Unnecessary use of -X or --request, GET is already inferred.
+*   Trying 18.194.125.175:80...
+* Connected to envoy-user1-resilience.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 80 (#0)
+> GET /api/missions HTTP/1.1
+> Host: envoy-user1-resilience.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> 
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< content-type: application/json
+< content-length: 36397
+< x-envoy-upstream-service-time: 23
+< date: Tue, 04 Aug 2020 11:06:31 GMT
+< server: envoy
+< set-cookie: bda4b546495930aad4a78627833fe986=96c5209247670261b784420dedae6412; path=/; HttpOnly
+< cache-control: private
+< 
+[[{"id":"92423720-1f51-4ad9-9761-9a3af4504a96","incidentId":"43e24efe-aab2-41c3-966d-6fc24f5fdb34","responderId":"241","responderStartLat":34.19679,"responderStartLong":-77.83360,"incidentLat":34.17552,"incidentLong":-77.87287,"destinationLat":34.1706,"destinationLong":-77.949,"responderLocationHistory":[{"lat":34.1993,"lon":-77.8486,"timestamp":1596483640318},{"lat":34.1995,"lon":-77.8649,"timestamp":1596483650299},{"lat":34.1928,"lon":-77.8664,"timestamp":1596483660302},{"lat":34.1817,"lon":-77.8612,"timestamp":1596483670312},{"lat":34.1736,"lon":-77.8673,"timestamp":1596483680311},{"lat":34.1754,"lon":-77.8728,"timestamp":1596483690315},{"lat":34.1713,"lon":-77.8815,"timestamp":1596483700313},{"lat":34.1774,"lon":-77.8929,"timestamp":1596483710312},{"lat":34.1819,"lon":-77.9083,"timestamp":1596483720313},{"lat":34.1794,"lon":-77.9212,"timestamp":1596483730308},{"lat":34.1688,"lon":-77.9313,"timestamp":1596483740325},{"lat":34.1643,"lon":-77.9416,"timestamp":1596483750323},{"lat":34.1707,"lon":-77.9484,"timestamp":1596483760322}],"status":"COMPLETED","steps":[{"lat":34.1969,"lon":-77.8342,"wayPoint":false,"destination":false},{"lat":34.1975,"lon":-77.8340,"wayPoint":false,"destination":false},{"lat":34.1992,"lon":-77.8399,"wayPoint":false,"destination":false},{"lat":34.1996,"lon":-77.8715,"wayPoint":false,"destination":false},{"lat":34.1853,"lon":-77.8609,"wayPoint":false,"destination":false},{"lat":34.1817,"lon":-77.8612,"wayPoint":false,"destination":false},{"lat":34.1813,"lon":-77.8644,"wayPoint":false,"destination":false},{"lat":34.1736,"lon":-77.8673,"wayPoint":false,"destination":false},{"lat":34.1754,"lon":-77.8728,"wayPoint":true,"destination":false},{"lat":34.1754,"lon":-77.8728,"wayPoint":false,"destination":false},{"lat":34.1725,"lon":-77.8746,"wayPoint":false,"destination":false},{"lat":34.1738,"lon":-77.8784,"wayPoint":false,"destination":false},{"lat":34.1709,"lon":-77.8803,"wayPoint":false,"destination":false},{"lat":34.1713,"lon":-77.8815,"wayPoint":false,"destination":false},{"lat":34.1738,"lon":-77.8805,"wayPoint":false,"destination":false},{"lat":34.1843,"lon":-77.9166,"wayPoint":false,"destination":false},{"lat":34.1613,"lon":-77.9384,"wayPoint":false,"destination":false},{"lat":34.1707,"lon":-77.9484,"wayPoint":false,"destination":true}]}]
+----
++
+The Envoy proxy acts as a proxy to the mission service.
+
+. If needed, stop the running incident finder service with `Ctrl+C`.
+. Edit the `.env` environment variable file to point the mission service REST client configuration to the Envoy proxy rather than the mission service.
++
+----
+MISSIONS_MP_REST_URL=http://envoy-user1-resilience.${OCP_APP_DOMAIN}
+----
+
+. Start the incident finder in development mode. Test the application. Expect the same result as the previous test.
++
+----
+$ curl localhost:8080/incidents?name="jones"
+----
++
+.Sample output
+----
+[{"id":"43e24efe-aab2-41c3-966d-6fc24f5fdb34","lat":"34.17552","lon":"-77.87287","medicalNeeded":true,"numberOfPeople":3,"victimName":"Theodore Jones","victimPhoneNumber":"(336) 555-8016","status":"RESCUED","timestamp":1596483630894,"destinationLat":34.1706,"destinationLon":null,"destinationName":"Wilmington Marine Center","currentPositionLat":34.1707,"currentPositionLon":-77.9484}]
+----
+
+With the Envoy proxy running and configured correctly, you have everything in place to start experimenting with the MicroProfile Fault Tolerance annotations.
+
+=== Make the Incident Finder Service Resilient - Retry
+
+. In order to use the MicroProfile Fault Tolerance, you need to add a dependency to the `quarkus-smallrye-fault-tolerance` extension in the `pom.xml` file of the project:
++
+----
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-smallrye-fault-tolerance</artifactId>
+    </dependency>
+----
+
+. The Envoy proxy can be configured to inject a given percentage of faults and delays by executing scripts inside the Envoy proxy pod. +
+Configure the Envoy proxy to return a HTTP `503 Service Unavailable` error code in 30% of the calls to the mission service.
++
+----
+$ ENVOY_POD=$(oc get pods -n user1-resilience | grep envoy | awk {'print $1'})
+$ oc project user1-resilience
+$ oc exec $ENVOY_POD -- ./enable_abort_fault_injection.sh -f 503 -p 30
+----
+
+. Perform a number of REST calls to the incident finder service:
+* With `curl`, you can use the following command:
++
+----
+$ while :; do curl -k -s -w %{http_code} --output /dev/null http://localhost:8080/incidents?name=jones; echo "";sleep .1; done
+----
++
+.Sample Output
+----
+503
+200
+503
+200
+200
+503
+200
+200
+200
+200
+200
+200
+503
+200
+200
+503
+503
+200
+200
+503
+200
+200
+503
+^C
+----
+* If you have _Siege_ installed on your system, execute the following command:
++
+TIP: On Fedora, you can install Siege with the `# dnf install siege` command. On macOS, you can use `$ brew install siege`.
++
+----
+$ siege -r 10 -c 1 -v http://localhost:8080/incidents?name=jones
+----
++
+.Sample Output
+----
+** SIEGE 4.0.5
+** Preparing 1 concurrent users for battle.
+The server is now under siege...
+HTTP/1.1 503     0.22 secs:      18 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.19 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.14 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 503     0.08 secs:      18 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 503     0.08 secs:      18 bytes ==> GET  /incidents?name=jones
+
+Transactions:                      7 hits
+Availability:                  70.00 %
+Elapsed time:                   1.33 secs
+Data transferred:               0.00 MB
+Response time:                  0.19 secs
+Transaction rate:               5.26 trans/sec
+Throughput:                     0.00 MB/sec
+Concurrency:                    0.99
+Successful transactions:           7
+Failed transactions:               3
+Longest transaction:            0.22
+Shortest transaction:           0.08
+----
+* Notice that around 30% of the calls fail with a HTTP `503` error code.
++
+NOTE: In the incident finder service, the mission service is called once for every incident returned by the call to the incident service. So the results you see from the `curl` or `siege` command may be different depending on how many incidents are returned. If you want to see similar results as above, be sure to query for a name that returns only 1 incident.
+
+. One of the MicroProfile Fault Tolerance annotations is `@Retry`, which can be applied to the class or method level. It defines a retry policy in case the method (or all the methods in the class if applied at class level) fails, where failure means that the method execution throws an exception. +
+Add the `@Retry` annotation to the `missionByIncidentId` method in the `MissionService` class of the incident finder project:
++
+----
+    @Retry
+    public JsonObject missionByIncidentId(String incidentId) {
+        return client.missionByIncident(incidentId);
+    }
+----
+
+. Run the Siege test again:
++
+----
+$ siege -r 10 -c 1 -v http://localhost:8080/incidents?name=jones
+----
++
+.Sample Output
+----
+** SIEGE 4.0.5
+** Preparing 1 concurrent users for battle.
+The server is now under siege...
+HTTP/1.1 200     1.79 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.22 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.14 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.17 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.15 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.21 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.14 secs:     388 bytes ==> GET  /incidents?name=jones
+
+Transactions:                     10 hits
+Availability:                 100.00 %
+Elapsed time:                   3.23 secs
+Data transferred:               0.00 MB
+Response time:                  0.32 secs
+Transaction rate:               3.10 trans/sec
+Throughput:                     0.00 MB/sec
+Concurrency:                    0.99
+Successful transactions:          10
+Failed transactions:               0
+Longest transaction:            1.79
+Shortest transaction:           0.13
+----
++
+Expect all calls to succeed with a HTTP `200 OK` response. 
++
+Also notice that the first call took considerably longer than the others. This is an effect of the hot reloading of the modified code by the Quarkus runtime. On the other hand, you did not have to restart the running application in order to apply the code changes!
+
+. Retry policies are useful when an upstream service suffers from occasional and temporary glitches. But when overused, it can quickly lead to a _retry storm_, where the number of retries become so massive that the situation becomes a lot worse for the upstream application. +
+That's why it is recommended to limit the retries both in number and in duration. The `@Retry` annotation can be configured to do exactly that. By default it will retry three times, but that number is configurable. +
+Change the `@Retry` annotation on the `missionByIncidentId` method to:
++
+----
+    @Retry(maxRetries = 4, maxDuration = 1000)
+    public JsonObject missionByIncidentId(String incidentId) {
+        return client.missionByIncident(incidentId);
+    }
+----
++
+This modifies the retry policy to: do maximum 4 retries, for a maximum duration of 1 second. Once the duration is reached, no more retries should be performed.
+
+. Reconfigure the envoy proxy to return a HTTP `503` error code in 80% of the calls.
++
+----
+$ oc exec $ENVOY_POD -- ./enable_abort_fault_injection.sh -f 503 -p 80
+----
+
+. Run the siege command again.
++
+----
+$ siege -r 10 -c 1 -v http://localhost:8080/incidents?name=jones
+----
++
+.Sample Output
+----
+** SIEGE 4.0.5
+** Preparing 1 concurrent users for battle.
+The server is now under siege...
+HTTP/1.1 200     0.90 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.16 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.36 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.37 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.16 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.28 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 503     0.53 secs:      18 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 503     0.47 secs:      18 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+
+Transactions:                      8 hits
+Availability:                  80.00 %
+Elapsed time:                   3.49 secs
+Data transferred:               0.00 MB
+Response time:                  0.44 secs
+Transaction rate:               2.29 trans/sec
+Throughput:                     0.00 MB/sec
+Concurrency:                    1.00
+Successful transactions:           8
+Failed transactions:               2
+Longest transaction:            0.90
+Shortest transaction:           0.13
+----
++
+Most calls should still succeed, but from time to time a call might fail, in the case the call to the mission service hits 5 `503` errors in a row.
+
+. Reset the Envoy proxy to no longer inject errors:
++
+----
+$ oc exec $ENVOY_POD -- ./disable_abort_fault_injection.sh
+----
+
+=== Make the Incident Finder Service Resilient - TimeOut
+
+Graceful timeout handling is an important aspect of improving the resiliency of an application. If a call to an upstream system takes too long, thread pools might get saturated and eventually the whole application can grind to a halt. In general it is preferable not to wait forever for a call to return, but to fail after the configured timeout value has expired. +
+MicroProfile Fault Tolerance provides the `@Timeout` annotation to handle timeouts.
+
+. Add the `@Timeout` annotation to the `missionByIncidentId` method in the `MissionService` class of the incident finder project. Set the timeout value to 500 milliseconds. Remove or comment out the @Retry annotation:
++
+----
+    //@Retry(maxRetries = 4, maxDuration = 1000)
+    @Timeout(500)
+    public JsonObject missionByIncidentId(String incidentId) {
+        return client.missionByIncident(incidentId);
+    }
+----
+
+. Run the Siege test. Expect all calls to succeed.
+
+. Configure the Envoy proxy to add a delay of 600 milliseconds in 30% of the calls to the mission service.
++
+----
+$ oc exec $ENVOY_POD -- ./enable_delay_fault_injection.sh -f 600 -p 30
+----
+
+. Run the Siege test. For statistically more relevant results, you can raise the number of concurrent users to 2. Expect roughly 30% of the calls to fail with a HTTP `500 Internal Server Error` error code.
++
+----
+siege -r 10 -c 2 -v http://localhost:8080/incidents?name=jones
+----
++
+.Sample Output
+----
+** SIEGE 4.0.5
+** Preparing 2 concurrent users for battle.
+The server is now under siege...
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.74 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.72 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.68 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.17 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.10 secs:     388 bytes ==> GET  /incidents?name=jones
+
+Transactions:                     13 hits
+Availability:                  65.00 %
+Elapsed time:                   3.50 secs
+Data transferred:               0.00 MB
+Response time:                  0.50 secs
+Transaction rate:               3.71 trans/sec
+Throughput:                     0.00 MB/sec
+Concurrency:                    1.85
+Successful transactions:          13
+Failed transactions:               7
+Longest transaction:            0.74
+Shortest transaction:           0.10
+----
+
+. The `@TimeOut` annotation can be used together with the `@Retry`. If so, in case of timeout, the method invocation will be retried according to the configuration of the `@Retry` method. As an example, set the `@Retry` annotation to 4 retries for a maximum duration of 2500s.
++
+----
+    @Retry(maxRetries = 4, maxDuration = 2500)
+    @Timeout(500)
+    public JsonObject missionByIncidentId(String incidentId) {
+        return client.missionByIncident(incidentId);
+    }
+----
+
+. Run the Siege test. Expect most of the calls to succeed. Based on the response time, you can guess how many retries were needed before the invocation was successful.
++
+----
+$ siege -r 10 -c 2 -v http://localhost:8080/incidents?name=jones
+** SIEGE 4.0.5 
+** Preparing 2 concurrent users for battle.
+The server is now under siege...
+HTTP/1.1 200     0.20 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.77 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     1.42 secs:     388 bytes ==> GET  /incidents?name=jones          
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones          
+HTTP/1.1 200     0.10 secs:     388 bytes ==> GET  /incidents?name=jones          
+HTTP/1.1 200     1.56 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     1.69 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     2.07 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     1.64 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+
+Transactions:                     20 hits
+Availability:                 100.00 %
+Elapsed time:                   5.65 secs
+Data transferred:               0.01 MB
+Response time:                  0.54 secs
+Transaction rate:               3.54 trans/sec
+Throughput:                     0.00 MB/sec
+Concurrency:                    1.92     
+Successful transactions:          20     
+Failed transactions:               0
+Longest transaction:            2.07
+Shortest transaction:           0.10
+----
+
+. Increase the frequency of the delays to 80 percent. Run the siege command again. Expect to see a lot more failures as you hit the retry limits.
++
+----
+$ oc exec $ENVOY_POD -- ./enable_delay_fault_injection.sh -d 600 -p 80
+----
+
+. In some case you don't want to retry in case of timeout, but only in case of an error returned by the upstream system. To do so you can configure the `@Retry` annotation to only retry on certain exceptions, or to abort retries on certain exceptions. +
+Change the `@Retry` annotation to ignore `org.eclipse.microprofile.faulttolerance.exceptions.TimeoutException` exceptions, which is the exception thrown when the timeout limit is reached.
++
+----
+    @Retry(maxRetries = 4, maxDuration = 2500, abortOn = {TimeoutException.class})
+    @Timeout(value = 500)
+    public JsonObject missionByIncidentId(String incidentId) {
+        return client.missionByIncident(incidentId);
+    }
+----
+
+. Run the Siege test again. Expect roughly 80% of the calls to fail, but none of the calls should take more than approximately 700 ms.
++
+----
+$ siege -r 10 -c 2 -v http://localhost:8080/incidents?name=jones
+----
++
+----
+** SIEGE 4.0.5
+** Preparing 2 concurrent users for battle.
+The server is now under siege...
+HTTP/1.1 500     0.71 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.72 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.68 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.70 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.70 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.68 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.68 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.68 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.69 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+
+Transactions:                      4 hits
+Availability:                  20.00 %
+Elapsed time:                   6.37 secs
+Data transferred:               0.00 MB
+Response time:                  2.89 secs
+Transaction rate:               0.63 trans/sec
+Throughput:                     0.00 MB/sec
+Concurrency:                    1.81
+Successful transactions:           4
+Failed transactions:              16
+Longest transaction:            0.72
+Shortest transaction:           0.11
+----
+
+=== Make the Incident Finder Service Resilient - Circuit Breaker
+
+A Circuit Breaker prevents repeated failures, so that dysfunctional services or APIs fail fast. There are three circuit states:
+
+* Closed: In normal operation, the circuit is closed. If a failure occurs, the Circuit Breaker records the event. In closed state the `requestVolumeThreshold` and `failureRatio` parameters may be configured in order to specify the conditions under which the breaker will transition the circuit to open. If the failure conditions are met, the circuit will be opened.
+
+* Open: When the circuit is open, calls to the service operating under the circuit breaker will fail immediately. A delay may be configured for the Circuit Breaker. After the specified delay, the circuit transitions to half-open state.
+
+* Half-open: In half-open state, trial executions of the service are allowed. By default one trial call to the service is permitted. If the call fails, the circuit will return to open state. The `successThreshold` parameter allows the configuration of the number of trial executions that must succeed before the circuit can be closed. After the specified number of successful executions, the circuit will be closed. If a failure occurs before the `successThreshold` is reached the circuit will transition to open.
+
+. Add the `@CircuitBreaker` annotation to the `missionByIncidentId` method in the `MissionService` class of the incident finder project. Remove or comment out the `@Retry` and `@TimeOut` annotations:
++
+----
+    //@Retry(maxRetries = 4, maxDuration = 1000)
+    //@Timeout(500)
+    @CircuitBreaker(successThreshold = 6, requestVolumeThreshold = 4, failureRatio=0.75, delay = 10000)
+    public JsonObject missionByIncidentId(String incidentId) {
+        return client.missionByIncident(incidentId);
+    }
+----
++
+The circuit breaker policy for this configuration policy is as follows: the circuit will open once 3 (4 x 0.75) failures occur among the rolling window of 4 consecutive invocations. The circuit will stay open for 10000 ms and then will transition to half open. After 6 consecutive successful invocations, the circuit will be back to closed again.
+
+. Configure the Envoy proxy to return  HTTP `503` error code for 50 percent of the invocations. Disable the delay injection.
++
+----
+$ oc exec $ENVOY_POD -- ./enable_abort_fault_injection.sh -f 503 -p 50
+$ oc exec $ENVOY_POD -- ./disable_delay_fault_injection.sh
+----
++
+NOTE: the disable scripts executed in the Envoy pod will throw an error if the corresponding functionality is not enabled. You can safely ignore these errors.
+
+. Run a Siege test. This time let the test run for a longer time, with a delay of up to 1 second between invocations. 
++
+----
+$ siege -r 1000 -d 1 -c 1 -v http://localhost:8080/incidents?name=jones
+----
++
+You will likely see a pattern like this:
++
+----
+HTTP/1.1 500     0.05 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 503     0.09 secs:      18 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.03 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.05 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.05 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.03 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.10 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.14 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 503     0.07 secs:      18 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.03 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 500     0.04 secs:       0 bytes ==> GET  /incidents?name=jones
+----
++
+The error codes `503` are thrown by the Envoy proxy. The `500` errors are from the circuit breaker which tripped open. After 10 seconds, the circuit breaker transition to half open, and that's when you see the `200` error codes. However, the first failed call trips the circuit back open.
+
+. While the Siege test is still running (restart it if you stopped it in the meanwhile), lower the frequency of error injection in the Envoy proxy to 25 percent.
++
+----
+$ oc exec $ENVOY_POD -- ./enable_abort_fault_injection.sh -f 503 -p 25
+----
+
+. Check the running Siege test. Expect to see the frequency of the circuit breaker tripping open going down.
+
+. Lower the frequency of error injection in the Envoy proxy to 15 percent. At this point, the circuit breaker stays almost always closed, as the chance of hitting three consecutive errors in a sliding window of 4 invocations become really low.
+
+. The `@CircuitBreaker` annotation can be used in combination with the `@Retry` and `@TimeOut` annotations. Feel free to experiment with a combinations of these annotations.
+
+=== Make the Incident Finder Service Resilient - Fallback
+
+Until now, the exceptions thrown by the methods annotated with MicroProfile Fault Tolerance annotations are passed to the caller, making it the caller's responsible to handle them. An alternative consists in providing a fallback class or method that will be called whenever a timeout is hit, the number of retries is exceeded or a circuit breaker trips open.
+
+In the case of the incident finder service, you could have a fallback method that returns null - the code in the `IncidentResource` class is capable of handling null values returned from the mission service.
+
+. In the `MissionService` class, add the `@Fallback` annotation to the `missionByIncidentId` method.
++
+----
+    //@Retry(maxRetries = 4, maxDuration = 1000)
+    //@Timeout(500)
+    @CircuitBreaker(successThreshold = 6, requestVolumeThreshold = 4, failureRatio=0.75, delay = 5000)
+    @Fallback(fallbackMethod= "fallback")
+    public JsonObject missionByIncidentId(String incidentId) {
+        return client.missionByIncident(incidentId);
+    }
+----
+
+. Add a method called `fallback` with the same signature as the main method, which simply returns null.
+
+. Reconfigure the Envoy proxy:
++
+----
+$ oc exec $ENVOY_POD -- ./enable_abort_fault_injection.sh -f 503 -p 50
+$ oc exec $ENVOY_POD -- ./disable_delay_fault_injection.sh
+----
+
+. Run a Siege test.
++
+----
+$ siege -r 1000 -d 1 -c 1 -v http://localhost:8080/incidents?name=jones
+----
++
+----
+HTTP/1.1 200     0.04 secs:     234 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.03 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.08 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.04 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.05 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.03 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.05 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.05 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.04 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.04 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.07 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.04 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.05 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.03 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.04 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.03 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.03 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.04 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.05 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.07 secs:     234 bytes ==> GET  /incidents?name=jones 
+HTTP/1.1 200     0.04 secs:     234 bytes ==> GET  /incidents?name=jones
+----
++
+Notice that all invocations return a HTTP `200 OK` code. However, the length of the response is different. The responses with 388 bytes represent successful invocations. In case the circuit breaker trips open, the response length is 234 bytes. +
+This corresponds, in this case, to the following response payloads: +
+For the successful invocations:
++
+----
+[{"id":"43e24efe-aab2-41c3-966d-6fc24f5fdb34","lat":"34.17552","lon":"-77.87287","medicalNeeded":true,"numberOfPeople":3,"victimName":"Theodore Jones","victimPhoneNumber":"(336) 555-8016","status":"RESCUED","timestamp":1596483630894,"destinationLat":34.1706,"destinationLon":-77.949,"destinationName":"Wilmington Marine Center","currentPositionLat":34.1707,"currentPositionLon":-77.9484}]
+----
++
+For the responses when the circuit breaker is open:
++
+----
+[{"id":"43e24efe-aab2-41c3-966d-6fc24f5fdb34","lat":"34.17552","lon":"-77.87287","medicalNeeded":true,"numberOfPeople":3,"victimName":"Theodore Jones","victimPhoneNumber":"(336) 555-8016","status":"RESCUED","timestamp":1596483630894}]
+----
+
+=== Configuring MicroProfile Fault Tolerance
+
+In the lab until now, the configuration of the MicroProfile Fault Tolerance is done in the source code of the application, by adding annotations to certain methods. +
+It might be interesting however to be able to override, configure or even disable the fault tolerance settings at runtime through configuration. The MicroProfile Fault Tolerance specification provides for this use case.
+
+. In the `MissionService` class, add a `@Timeout` annotation to the `missionByIncidentId` method, with a threshold of 500 milliseconds, and a default `@Retry` annotation. Remove or comment the other annotations.
++
+----
+    @Retry()
+    @Timeout(500)
+    public JsonObject missionByIncidentId(String incidentId) {
+        return client.missionByIncident(incidentId);
+    }
+----
+
+. Configure the Envoy proxy to inject a delay of 500 ms in 50 % of the calls.
++
+----
+$ oc exec $ENVOY_POD -- ./enable_delay_fault_injection.sh -d 500 -p 50
+$ oc exec $ENVOY_POD -- ./disable_abort_fault_injection.sh
+----
+
+. Run a Siege test:
++
+----
+$ siege -r 30 -d 0.2 -c 1 -v http://localhost:8080/incidents?name=jones
+----
++
+.Sample Output
+----
+** SIEGE 4.0.5
+** Preparing 1 concurrent users for battle.
+The server is now under siege...
+HTTP/1.1 200     0.14 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.85 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.65 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.74 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.16 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.80 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     2.28 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 500     2.60 secs:       0 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.67 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.75 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.71 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     1.44 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     1.83 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     1.90 secs:     388 bytes ==> GET  /incidents?name=jones
+
+Transactions:                     29 hits
+Availability:                  96.67 %
+Elapsed time:                  20.22 secs
+Data transferred:               0.01 MB
+Response time:                  0.60 secs
+Transaction rate:               1.43 trans/sec
+Throughput:                     0.00 MB/sec
+Concurrency:                    0.86
+Successful transactions:          29
+Failed transactions:               1
+Longest transaction:            2.60
+Shortest transaction:           0.11
+----
++
+Expect a successful invocation for the vast majority of calls: it takes 5 consecutive delayed responses for the call to fail.
+
+. Increase the frequency of delay injection to 80 percent:
++
+----
+$ oc exec $ENVOY_POD -- ./enable_delay_fault_injection.sh -d 500 -p 80
+----
++
+Run the Siege test again. This time expect a significantly higher failure rate.
+
+. There are several possibilities to externalize the runtime configuration for a Quarkus application. One way is through environment variables - set individually or provided as a `.env` file. However, there are limitations and conventions around environment variables, so they are not suited for every kind of configuration setting. +
+Another possibility is to provide an `application.properties` file in a directory named `config` which resides in the directory where the application runs. +
+This method is also available in development mode, where the `config` directory needs to be placed in the build target folder of the application. You just need to be aware that any cleaning operation from the build tool like `mvn clean ` will remove the config directory as well.
+* Create a directory named `config` in the `target` directory of the incident finder project. Create a file `application.properties` in the `config` directory.
++
+----
+$ mkdir target/config
+$ touch target/config/application.properties
+----
+* Open the file with your favorite text editor.
+* In order to reduce the number of failures with the current proxy settings, you could increase the number of retries, or increase the timeout value. To do the latter, add the following to the `application.properties` file:
++
+----
+com.redhat.emergency.response.incident.finder.MissionService/missionByIncidentId/Timeout/value=700
+----
++
+To override a MicroProfile Fault Tolerance parameter, you need to set a configuration property with the structure `<classname>/<methodname>/<annotation>/<parameter>` (in the case of a class level annotation, this would become `<classname>/<annotation>/<parameter>`). Parameters can also be overridden globally with a configuration setting with the structure `<annotation>/<parameter>`. 
+. Restart the incident finder service - the `config/application.properties file` is only read at startup.
+. Run the Siege test again. As you increased the timeout threshold to 700 ms, while the Envoy injected delay is only 500 ms, expect all the calls to succeed.
++
+----
+$ siege -r 30 -d 0.2 -c 1 -v http://localhost:8080/incidents?name=jones
+** SIEGE 4.0.5
+** Preparing 1 concurrent users for battle.
+The server is now under siege...
+HTTP/1.1 200     1.26 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.64 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.65 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.64 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.12 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.64 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.62 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.61 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.64 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.13 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.62 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.62 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.62 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.14 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.62 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.63 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.11 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.62 secs:     388 bytes ==> GET  /incidents?name=jones
+HTTP/1.1 200     0.62 secs:     388 bytes ==> GET  /incidents?name=jones
+
+Transactions:                     30 hits
+Availability:                 100.00 %
+Elapsed time:                  19.57 secs
+Data transferred:               0.01 MB
+Response time:                  0.55 secs
+Transaction rate:               1.53 trans/sec
+Throughput:                     0.00 MB/sec
+Concurrency:                    0.84
+Successful transactions:          30
+Failed transactions:               0
+Longest transaction:            1.26
+Shortest transaction:           0.11
+----
+
+. Individual Fault Tolerance policies can be disabled by setting a configuration property with value `enabled=false`. 
+* For example, change the settings in the `application.properties` file to:
++
+----
+Timeout/enabled=false
+----
++
+This setting disables the timeout globally. You can also disable policies at the class or method level with `<classname>/<methodname>/<annotation>/enabled=false` and `<classname>/<annotation>/enabled=false`.
+* Stop and start the application, and run the Siege test again. Expect the same results as the previous test.
+
+== MicroProfile Fault Tolerance Metrics
+
+With MicroProfile Fault Tolerance you can easily apply common fault mitigation strategies to a Quarkus application. However, when these mitigation strategies kick in, this is an indication that something is going wrong in your overall system (for example upstream systems that are unavailable or respond slower than expected). Therefore it is essential that the behavior of the mitigation strategies can be measured and monitored. MicroProfile Fault Tolerance is integrated with MicroProfile Metrics, and exposes metrics that allow you to monitor the Fault Tolerance policies that you added to the application.
+
+In this section of the lab, you are going to deploy the incident finder service to OpenShift, deploy a monitoring stack consisting of Prometheus and Grafana, and import a dashboard for the MicroProfile Fault Tolerance metrics. 
+
+. Add a dependency to to the Quarkus `quarkus-smallrye-metrics` extension in the `pom.xml` file of the project:
++
+----
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-smallrye-metrics</artifactId>
+    </dependency>
+----
+
+. In the `MissionService` class, add the following annotations to the `missionByIncidentId` method:
++
+----
+    @Timeout()
+    @CircuitBreaker()
+    @Fallback(fallbackMethod= "fallback")
+    public JsonObject missionByIncidentId(String incidentId) {
+        return client.missionByIncident(incidentId);
+    }
+----
+
+. Build the application, create an application image and deploy the image to the OpenShift registry.
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-resilience/incident-finder-service:resilience .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-resilience/incident-finder-service:resilience
+----
+
+. Create a configmap for the configuration of the incident finder service.
++
+----
+$ echo '
+incidents/mp-rest/url=http://incident-service.user1-er-demo.svc:8080
+missions/mp-rest/url=http://envoy:8080
+shelters/mp-rest/url=http://disaster-service.user1-er-demo.svc:8080
+
+com.redhat.emergency.response.incident.finder.MissionService/missionByIncidentId/Timeout/value=500
+com.redhat.emergency.response.incident.finder.MissionService/missionByIncidentId/CircuitBreaker/successThreshold=4
+com.redhat.emergency.response.incident.finder.MissionService/missionByIncidentId/CircuitBreaker/requestVolumeThreshold=4
+com.redhat.emergency.response.incident.finder.MissionService/missionByIncidentId/CircuitBreaker/failureRatio=0.75
+com.redhat.emergency.response.incident.finder.MissionService/missionByIncidentId/CircuitBreaker/delay=5000
+' | tee  /tmp/incident-finder-service-application.properties
+$ oc create configmap incident-finder-service -n user1-resilience --from-file=application.properties=/tmp/incident-finder-service-application.properties
+----
+
+. Deploy the incident finder service in the `user1-resilience` namespace:
++
+----
+$ echo '
+kind: DeploymentConfig
+apiVersion: apps.openshift.io/v1
+metadata:
+  name: incident-finder-service
+  labels:
+    app: incident-finder-service
+spec:
+  strategy:
+    type: Rolling
+    rollingParams:
+      updatePeriodSeconds: 1
+      intervalSeconds: 1
+      timeoutSeconds: 3600
+      maxUnavailable: 25%
+      maxSurge: 25%
+    resources: {}
+    activeDeadlineSeconds: 21600
+  triggers:
+    - type: ConfigChange
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        containerNames:
+          - incident-finder-service
+        from:
+          kind: ImageStreamTag
+          name: incident-finder-service:resilience
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    app: incident-finder-service
+    group: erd-services
+  template:
+    metadata:
+      labels:
+        app: incident-finder-service
+        group: erd-services
+    spec:
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+        - resources:
+            limits:
+              cpu: 250m
+              memory: 250Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 3
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          terminationMessagePath: /dev/termination-log
+          name: incident-finder-service
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          env:
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+          securityContext:
+            privileged: false
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: config
+              mountPath: /deployments/config
+          terminationMessagePolicy: File
+      volumes:
+        - name: config
+          configMap:
+            name: incident-finder-service
+            defaultMode: 420
+      dnsPolicy: ClusterFirst
+' | oc create -f - -n user1-resilience
+----
+
+. Expose the incident finder service
++
+----
+$ echo '
+kind: Service
+apiVersion: v1
+metadata:
+  name: incident-finder-service
+  labels:
+    app: incident-finder-service
+spec:
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+  selector:
+    app: incident-finder-service
+    group: erd-services
+  type: ClusterIP
+' | oc create -f - -n user1-resilience
+$ oc expose service incident-finder-service -n user1-resilience
+----
+
+. Deploy the monitoring stack. +
+In a terminal window, navigate to the directory where you checked out the Ansible installer for the Emergency Response application. Change to the `ansible` directory, and run the following Ansible playbook:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/monitoring.yml -e project_admin=user1 -e project_name=resilience -e namespace_monitoring=user1-resilience -e monitoring_label_value=user1-resilience-monitoring
+----
+
+. Create a role and rolebinding for the Prometheus service account.
+* Create a role in the `user1-resilience` namespace:
++
+----
+$ echo '
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-monitoring
+rules:
+- apiGroups: [""]
+  resources:
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources:
+  - configmaps
+  verbs: ["get"]
+' | oc create -f - -n user1-resilience
+----
+* Add the role to the Prometheus service account:
++
+----
+$ oc adm policy add-role-to-user prometheus-monitoring system:serviceaccount:user1-resilience:prometheus-service-account --role-namespace=user1-resilience
+----
+
+. Create a _ServiceMonitor_ custom resource for the incident finder application:
++
+---- 
+$ echo '
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: incident-finder-service
+spec:
+  endpoints:
+    - interval: 5s
+      path: /metrics
+      port: http
+  namespaceSelector:
+    matchNames:
+      - user1-resilience
+  selector:
+    matchLabels:
+      monitoring: prometheus
+' | oc create -f - -n user1-resilience
+----
+
+. Label the incident finder service with the monitoring label:
++
+----
+$ oc label service incident-finder-service -n user1-resilience monitoring=prometheus
+----
+
+. The `grafana` directory in the root folder of the incident finder service project contains a _GrafanaDashboard_ custom resource definition for a dashboard for the  MicroProfile Fault Tolerance metrics. +
+Deploy the Grafana Dashboard:
++
+----
+$ oc create -f grafana/microprofile-ft-dashboard.yml -n user1-resilience
+----
++
+.Output
+----
+grafanadashboard.integreatly.org/microprofile-ft-dashboard created
+----
+
+. Obtain the URL to the Grafana instance in the `user1-resilience` namespace:
++
+----
+$ echo https://$(oc get route grafana-route -n user1-resilience --template='{{ .spec.host }}')
+----
+
+. In a browser window, navigate to the Grafana URL. Login with your OpenShift credentials. Open the `MicroProfile Fault Tolerance` dashboard.
++
+image::images/grafana-dashboard-mp-ft.png[]
+
+. Reconfigure the Envoy proxy to inject a delay of 600 ms in 25 percent of the calls.
++
+----
+$ oc exec $ENVOY_POD -- ./enable_delay_fault_injection.sh -d 600 -p 25
+$ oc exec $ENVOY_POD -- ./disable_abort_fault_injection.sh
+----
+
+. Run a Siege test against the incident finder service on OpenShift.
++
+----
+$ INCIDENT_FINDER_SERVICE_URL=$(oc get route incident-finder-service -n user1-resilience --template='{{ .spec.host }}')
+$ siege -r 1000 -d 1 -c 1 -v http://${INCIDENT_FINDER_SERVICE_URL}/incidents?name=jones
+----
+
+. Check the Grafana dashboard, in particular the _Basic Metrics_, _Fallback Metrics_, _Timeout Metrics_ and _Circuit Breaker Metrics_ panels. While the siege test is still running, modify the delay percentage in the Envoy pod - increase the frequency to 50%, or decrease the frequency to 15%, and observe the changes in the metrics.
++
+image::images/grafana-dashboard-mp-ft-1.png[]
+
+
+== Tear Down the Environment
+
+In order to free up resources on the OpenShift cluster, you can tear down the environment you built during this lab. +
+To do so, execute the following Ansible and `oc` commands:
+
+----
+$ ansible-playbook -i inventories/inventory playbooks/monitoring.yml -e project_admin=user1 -e project_name=resilience -e namespace_monitoring=user1-resilience -e ACTION=uninstall
+$ oc delete servicemonitor incident-finder-service -n user1-resilience
+$ oc delete grafanadashboard microprofile-ft-dashboard -n user1-resilience
+$ oc delete project user1-resilience
+----

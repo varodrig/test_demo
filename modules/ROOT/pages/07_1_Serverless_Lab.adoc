@@ -1,0 +1,1129 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== Serverless Applications Lab
+
+.Prerequisites
+* Access to a Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6
+
+.Goals
+* Transform a messaging processing application into a serverless application using Knative Serving and Eventing.
+* Use Knative Eventing to decouple message sources from message consumers.
+
+:numbered:
+
+== Introduction
+
+Knative extends facilities in Openshift and Kubernetes to provide a scalable environment for deploying services that scale up and down based on demand. It also provides an eventing mechanism to provide decoupled messaging to applications running inside an Openshift or Kubernetes cluster.
+
+Knative consists of the following components:
+
+* Serving - Request-driven compute that can scale to zero
+* Eventing - Management and delivery of events to and from Knative services
+
+Knative Serving is ideal for running application services inside OpenShift by providing a more simplified deployment syntax with automated scale-to-zero and scale-out based on HTTP load. The Knative platform will manage your service’s deployments, revisions, networking and scaling. Knative Serving exposes your service via an HTTP URL. As the Knative Serving Service has the built in ability to automatically scale down to zero when not in use, it is apt to call it as “serverless service”. Knative Serving is mostly adapted for stateless applications with minimal or no dependencies on other systems.
+
+Knative Eventing designed to decouple event sources and event consumers. Knative Eventing services are loosely coupled and can be developed and deployed independently. Event producers and event consumers are independent. Any producer (or source), can generate events before there are active event consumers that are listening. Any event consumer can express interest in an event or class of events, before there are producers that are creating those events. Cross-service interoperability is provided by adhering to the CloudEvents specification that is developed by the Cloud Native Computing Foundation Serverless working Group.
+
+These are the primary usage patterns with Knative Eventing:
+
+* *Source to Sink* +
+Source to Service provides the simplest usage pattern with Knative Eventing. It provides a single Sink — that is, event receiving service —, with no queuing, backpressure, and filtering. The Source to Sink does not support replies, which means the response from the Sink service is ignored. The responsibility of the Event Source it just to deliver the message without waiting for the response from the Sink, in analogy to the fire and forget messaging pattern.
++
+image::images/knative-source-sink.png[]
+
+* *Channel and Subscription* +
+With the Channel and Subscription, the Knative Eventing system defines a Channel, which can connect to various backends such as In-Memory, Kafka and Google Cloud Platform PubSub for sourcing the events. Each Channel can have one or more subscribers in the form of Sink services, which can receive the event messages and process them as needed. Each message from the Channel is formatted as CloudEvent and sent further up in the chain to other Subscribers for further processing. The Channels and Subscription usage pattern does not have the ability to filter messages.
++
+image::images/knative-channels-subs.png[]
+
+* *Broker and Trigger* +
+The Broker and Trigger are similar to Channel and Subscription, except that they support filtering of events. Event filtering is a method that allows the subscribers to show an interest on certain set of messages that flows into the Broker. For each Broker, Knative Eventing will implicitly create a Knative Eventing Channel. The Trigger gets itself subscribed to the Broker and applies the filter on the messages on its subscribed broker. The filters are applied on the on the CloudEvent attributes of the messages, before delivering it to the interested Sink Services (subscribers).
++
+image::images/knative-brokers-triggers.png[]
+
+CloudEvents (https://cloudevents.io) is a specification for describing event data in a common way. It aims to provide consistency in the way events are modeled and portability between platforms and frameworks. CloudEvents provides SDKs for Go, JavaScript, Java, C#, Ruby, and Python that providing common libraries and tooling for delivering event data across environments.
+
+In this lab you transform an event driven service into a serverless service, using Knative Serving and Knative Eventing, more specifically the Kafka components of Knative Eventing, which allow to use a Kafka broker to propagate CloudEvent messages to and from serverless services.
+
+The use case for the lab is the following: there is a requirement in the Emergency Response application to gather and consolidate information from the missions, incidents and responders for analytical purposes. To fulfill the requirement, the mission analytics service has been developed. It consumes _MissionCompletedEvent_ messages produced by the mission service, and enhances the data with data obtained from the incident and responder services. Considering the stateless nature of the service, this is a good candidate to transform into a serverless service. 
+
+== Deploy the Mission Analytics Service
+
+In this section of the lab you deploy the mission analytics service and verify its functionality.
+
+. Check out the code for the mission analytics service:
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/mission-analytics.git
+$ cd mission-analytics
+----
+. Import the code into your IDE of choice.
+. Ensure the code builds correctly:
++
+----
+$ mvn clean package
+----
+. Familiarize yourself with the code. The mission analytics service is implemented using Quarkus. The functionality in a nutshell: the service consumes _MissionCompletedEvent_ messages from the `topic-mission-event` topic. When a message is received, the Emergency Response incident and responder services are called over their REST endpoints to enrich the data in the _MissionCompletedEvent_ message with details about the incident and the responder attached to the mission. Finally the enriched data is sent to another Kafka topic for consumption by other services. +
+The implementation uses MicroProfile Reactive Messaging and MicroProfile REST Client. +
+Some classes of interest include:
+* `IncidentService` and `ResponderService`: interfaces for the incident and responder service REST endpoints, annotated with JAX-RS and MicroProfile REST Client annotations.
+* `MissionSource`: implements the processing of _MissionCompletedEvent_ messages consumed from the `topic-mission-event` topic. Delegates to the `IncidentService` and `ResponderService` interfaces to call the incident and responder services. +
+Notice the `@Blocking` annotation, which makes sure the code is executed on a worker thread rather than on the event loop thread, which should never be blocked. +
+The `@Acknowledgement` annotation defines how messages are acknowledged. In this case, they are acknowledged immediately upon consumption, before the processing of the message. +
+The resulting `Mission` instance is serialized to a JSON String and sent to the `topic-mission-data` topic.
+* The `reactive` branch of the source code contains a reactive and asynchronous implementation of the service. 
+
+. Create a new project for the mission analytics service.
++
+----
+$ oc new-project user1-mission-analytics
+----
+
+. Build the application, create an image and push to OpenShift:
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-mission-analytics/mission-analytics:latest .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-mission-analytics/mission-analytics:latest
+----
++
+This creates an ImageStream in the `user1-mission-analytics` project pointing to the image.
+
+. Create a configmap for the external configuration of the mission analytics service. The configuration settings assume that you deployed the Emergency Response application in the `user1-er-demo` namespace. If your namespace is different you have to adjust the configuration settings.
++
+----
+$ echo '
+kafka.bootstrap.servers=kafka-cluster-kafka-bootstrap.user1-er-demo.svc:9092
+
+mp.messaging.incoming.mission-event.topic=topic-mission-event
+mp.messaging.incoming.mission-event.group.id=mission-analytics
+
+mp.messaging.outgoing.mission-data.topic=topic-mission-data
+
+incident-service/mp-rest/url=http://incident-service.user1-er-demo.svc:8080
+responder-service/mp-rest/url=http://responder-service.user1-er-demo.svc:8080
+
+' | tee /tmp/mission-analytics-application.properties
+$ oc create configmap mission-analytics -n user1-mission-analytics --from-file=application.properties=/tmp/mission-analytics-application.properties
+----
+
+. Create a deploymentconfig for the mission analytics application:
++
+----
+$ echo '
+kind: DeploymentConfig
+apiVersion: apps.openshift.io/v1
+metadata:
+  name: mission-analytics-service
+  labels:
+    app: mission-analytics-service
+spec:
+  strategy:
+    type: Rolling
+    rollingParams:
+      updatePeriodSeconds: 1
+      intervalSeconds: 1
+      timeoutSeconds: 3600
+      maxUnavailable: 25%
+      maxSurge: 25%
+    resources: {}
+    activeDeadlineSeconds: 21600
+  triggers:
+    - type: ConfigChange
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        containerNames:
+          - mission-analytics-service
+        from:
+          kind: ImageStreamTag
+          name: mission-analytics:latest
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    app: mission-analytics-service
+    group: erd-services
+  template:
+    metadata:
+      labels:
+        app: mission-analytics-service
+        group: erd-services
+    spec:
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+        - resources:
+            limits:
+              cpu: 250m
+              memory: 250Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 3
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          terminationMessagePath: /dev/termination-log
+          name: mission-analytics-service
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          env:
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+          securityContext:
+            privileged: false
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: config
+              mountPath: /deployments/config
+          terminationMessagePolicy: File
+      volumes:
+        - name: config
+          configMap:
+            name: mission-analytics
+            defaultMode: 420
+      dnsPolicy: ClusterFirst
+' | oc create -f - -n user1-mission-analytics
+----
+
+. Create the `topic-mission-data` Kafka topic:
++
+----
+$ echo '
+apiVersion: kafka.strimzi.io/v1beta1
+kind: KafkaTopic
+metadata:
+  name: topic-mission-data
+  labels:
+    strimzi.io/cluster: kafka-cluster
+spec:
+  partitions: 15
+  replicas: 3
+  config: {}
+' | oc create -f - -n user1-er-demo
+----
+
+. The Kafka consumer application is a simple Quarkus application that consumes messages from a given topic and logs the payload and metadata of each message to _stdout_. +
+Deploy the Kafka consumer application:
+* Make sure you are logged in the OpenShift cluster as a user with admin privileges.
+* Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+* Copy the inventory template file
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+* Install the Kafka consumer application:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_consumer_app.yml -e project_admin=user1 -e project_name=mission-analytics -e namespace_kafka_cluster=user1-er-demo -e kafka_topic=topic-mission-data
+----
++
+The application is configured to consume messages from the `topic-mission-data` topic.
+
+. Test the mission analytics service. In a browser window, navigate to the Emergency Response application console, log in as _incident_commander_, and start a simulation.
+
+. Check the logs of the Kafka consumer app for messages produced by the mission analytics service:
++
+----
+2020-08-01 12:26:51,367 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-4) Consumed message from topic 'topic-mission-data', partition '0', offset '0'
+2020-08-01 12:26:51,368 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-4)     Headers: 
+2020-08-01 12:26:51,368 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-4)     Message key: b2fbc3aa-ab9f-4e9f-a33c-79212c09448e
+2020-08-01 12:26:51,369 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-4)     Message value: {"missionId":"b2fbc3aa-ab9f-4e9f-a33c-79212c09448e","incidentId":null,"incidentName":"David Ramirez","incidentLatitude":34.18108,"incidentLongitude":-77.89718,"incidentNumberOfPeople":7,"incidentMedicalNeeded":true,"incidentTimestamp":1596275741414,"responderId":"60","responderName":"Easton Watson","destinationLatitude":34.1706,"destinationLongitude":-77.949,"missionCompetedTimestamp":1596275950307}
+2020-08-01 12:26:51,370 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-5) Consumed message from topic 'topic-mission-data', partition '0', offset '1'
+2020-08-01 12:26:51,370 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-5)     Headers: 
+2020-08-01 12:26:51,370 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-5)     Message key: 2ada23d9-f25c-4e60-87cc-f31e29b7bbba
+2020-08-01 12:26:51,370 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-5)     Message value: {"missionId":"2ada23d9-f25c-4e60-87cc-f31e29b7bbba","incidentId":null,"incidentName":"Elias Hernandez","incidentLatitude":34.21842,"incidentLongitude":-77.80332,"incidentNumberOfPeople":7,"incidentMedicalNeeded":true,"incidentTimestamp":1596284502837,"responderId":"60","responderName":"Easton Watson","destinationLatitude":34.2461,"destinationLongitude":-77.9519,"missionCompetedTimestamp":1596284730282}
+----
+
+== Deploy Knative Operators
+
+In this section of the lab you install the required building blocks for Knative Serving and Eventing.
+
+. Deploy the Serverless operator. You can install the operator through the OpenShift console, or by running the following Ansible playbook from the Ansible installer for the Emergency Response demo: 
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/knative.yml
+----
++
+If you prefer to install the operator manually through the OpenShift UI, makes sure to install the `OpenShift Serverless Operator`.
++
+image::images/openshift-operatorhub-serverless-operators.png[]
+
+. Check that the operator is deployed successfully:
++
+image::images/openshift-serverless-operator.png[]
+
+. Install Knative Serving.
+* Create a _KnativeServing_ custom resource in the `knative-serving` namespace:
++
+----
+$ echo '
+apiVersion: operator.knative.dev/v1alpha1
+kind: KnativeServing
+metadata:
+    name: knative-serving
+' | oc create -f - -n knative-serving
+----
++
+.Output:
+----
+knativeserving.operator.knative.dev/knative-serving created
+----
+* Verify the successful installation of Knative Serving:
++
+----
+$ oc get knativeserving.operator.knative.dev/knative-serving -n knative-serving --template='{{range .status.conditions}}{{printf "%s=%s\n" .type .status}}{{end}}'
+----
++
+.Expected Output:
+----
+DependenciesInstalled=True
+DeploymentsAvailable=True
+InstallSucceeded=True
+Ready=True
+VersionMigrationEligible=True
+----
+* Notice that the installation of the custom resource created a number of pods in the `knative-serving` namespace:
++
+----
+$ oc get pods -n knative-serving
+----
++
+.Sample Output
+----
+NAME                                                            READY   STATUS        RESTARTS   AGE
+activator-6587c7d598-662m5                                      1/1     Running       0          59s
+activator-6587c7d598-gskh7                                      1/1     Running       0          74s
+autoscaler-6c64cc4b98-2bkjj                                     1/1     Running       0          73s
+autoscaler-hpa-89698bf4d-mds7f                                  1/1     Running       0          70s
+autoscaler-hpa-89698bf4d-sldgw                                  1/1     Running       0          70s
+controller-77954d7647-9csml                                     1/1     Terminating   0          73s
+controller-7c9b96ff6f-bj6wd                                     1/1     Running       0          64s
+controller-7c9b96ff6f-l8l58                                     1/1     Running       0          72s
+kn-cli-79qrk-deployment-7b56dcfbcf-hb2cn                        2/2     Running       0          42s
+storage-version-migration-serving-0.17.3-serving-0.17.3-rmp7d   0/1     Completed     0          69s
+webhook-5b78b94c88-n76lq                                        1/1     Running       0          73s
+----
+
+. Install Knative Eventing.
+* Create a _KnativeEventing_ custom resource in the `knative-eventing` namespace:
++
+----
+$ echo '
+apiVersion: operator.knative.dev/v1alpha1
+kind: KnativeEventing
+metadata:
+    name: knative-eventing
+' | oc create -f - -n knative-eventing
+----
++
+.Output:
+----
+knativeeventing.operator.knative.dev/knative-eventing created
+----
+* Verify the successful installation of Knative Eventing:
++
+----
+$ oc get knativeeventing.operator.knative.dev/knative-eventing -n knative-eventing --template='{{range .status.conditions}}{{printf "%s=%s\n" .type .status}}{{end}}'
+----
++
+.Expected Output
+----
+DependenciesInstalled=True
+DeploymentsAvailable=True
+InstallSucceeded=True
+Ready=True
+VersionMigrationEligible=True
+----
+* Notice that the installation of the custom resource created a number of pods in the `knative-eventing` namespace:
++
+----
+$ oc get pods -n knative-eventing
+----
++
+.Sample Output
+----
+NAME                                               READY   STATUS      RESTARTS   AGE
+eventing-controller-848bcbd4f9-622kb               1/1     Running     0          95s
+eventing-webhook-78dcf96448-5bxwf                  1/1     Running     0          95s
+imc-controller-8559ff856b-klbgt                    1/1     Running     0          90s
+imc-dispatcher-575c7fcd8d-57j7f                    1/1     Running     0          90s
+mt-broker-controller-56857cccc5-jck5p              1/1     Running     0          89s
+mt-broker-filter-784b7db965-2jzr8                  1/1     Running     0          89s
+mt-broker-ingress-6b9f847866-7wk2r                 1/1     Running     0          89s
+sugar-controller-594784974b-gsbr2                  1/1     Running     0          88s
+v0.17.0-pingsource-cleanup-eventing-0.17.2-jtk2k   0/1     Completed   0          88s
+----
+
+== Refactor the Mission Analytics Application
+
+The mission analytics application consumes messages from a Kafka topic and sends enriched mission data back to a Kafka topic. Serverless applications however, need to expose a REST endpoint consuming _CloudEvents_. The REST endpoint is called by the serverless infrastructure whenever payload is sent to the serverless application.
+
+In order to transform the mission application to a serverless application, the application needs to be refactored to consume Cloud Events over HTTP POST, rather than consuming messages directly from a Kafka topic.
+
+. Add a dependency on the `quarkus-resteasy` extension in the `pom.xml` file of the project, in order to enable REST functionality:
++
+----
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-resteasy</artifactId>
+    </dependency>
+----
+. In the `MissionSource` class of the mission analytics service, add the following changes:
+* Add the JAX-RS `@Path("/")` annotation to the class declaration.
+* Remove the MicroProfile Reactive Messaging annotations on the `process` method.
+* Add the JAX-RS `@POST` and `@Path("/")`` annotation to the `process` method.
+* Change the `process` method to take a String as a parameter and return a JAX-RS response.
++
+----
+    @POST
+    @Path("/")
+    public Response process(String payload) {
+        [...]
+    }
+----
+* When consuming messages through MicroProfile Reactive Messaging, the payload is encapsulated in a Message envelope. This is different with CloudEvents, where you consume directly the payload. The CloudEvent specific metadata is passed along as HTTP headers. If you want to access these headers, you can do something like this:
++
+----
+    @POST
+    @Path("/")
+    public Response process(String payload, @Context HttpHeaders httpHeaders) {
+
+        log.debug("ce-id: " + httpHeaders.getHeaderString("ce-id"));
+        log.debug("ce-source: " + httpHeaders.getHeaderString("ce-source"));
+        log.debug("ce-specversion: " + httpHeaders.getHeaderString("ce-specversion"));
+        log.debug("ce-time: " + httpHeaders.getHeaderString("ce-time"));
+        log.debug("ce-type: " + httpHeaders.getHeaderString("ce-type"));
+        log.debug("ce-key: " + httpHeaders.getHeaderString("ce-key"));
+        
+        [...]
+    }
+----
+* In the implementation of the `process` method, modify the code to work directly on the payload. If the payload does not represent a _MissionCompletedEvent_ message, return a HTTP `200 OK` response.
++
+----
+    log.debug("Processing payload " + payload);
+
+    JsonObject json = new JsonObject(payload);
+
+    if (!"MissionCompletedEvent".equals(json.getString("messageType"))) {
+        log.debug("Ignoring message with MessageType " + json.getString("messageType"));
+        return Response.ok().build();
+    }
+
+    JsonObject body = json.getJsonObject("body");
+----
+* Change the return type of the `process` method to a HTTP `200 OK` response.
++
+----
+    return Response.ok().build();
+----
+
+. You still need to send the enhanced mission data to the `topic-mission-data` Kafka topic. To accomplish this, add the following code to the `MissionSource` class:
+* Add a class variable for a `UnicastProcessor` to hold the `Mission` instances:
++
+----
+    private final UnicastProcessor<Mission> missionProcessor = UnicastProcessor.create();
+----
++
+A `UnicastProcessor` is an implementation of a processor using a queue to store items and allows a single subscriber to receive these items.
+* In the `process` method, publish the `Mission` instance to the processor:
++
+----
+        Mission mission = [...];
+
+        missionProcessor.onNext(mission);
+
+        return Response.ok().build();
+----
+* Add a method annotated with the `@Outgoing("mission-data")` annotation to produce a Kafka message from the `Mission` instance:
++
+----
+    @Outgoing("mission-data")
+    Multi<Message<String>> produceMission() {
+        return missionProcessor.onItem().apply(mission -> KafkaRecord.of(mission.getMissionId(), Json.encode(mission)));
+    }
+----
++
+According to the MicroProfile Reactive Messaging specification, methods annotated with `@Outgoing` to produce data can't take method arguments, hence the usage of the `UnicastProcessor` to allow the `produceMission` method to consume `Mission` instances and send them to the Kafka topic.
+
+. In the `src/main/resources/application.properties`, remove or comment out the configuration settings for the incoming MicroProfile Reactive Messaging channel.
++
+----
+# Configure the Kafka source - (unneeded when using Knative events)
+#mp.messaging.incoming.mission-event.connector=smallrye-kafka
+#mp.messaging.incoming.mission-event.key.deserializer=org.apache.kafka.common.serialization.StringDeserializer
+#mp.messaging.incoming.mission-event.value.deserializer=org.apache.kafka.common.serialization.StringDeserializer
+#mp.messaging.incoming.mission-event.request.timeout.ms=30000
+#mp.messaging.incoming.mission-event.enable.auto.commit=false
+----
+
+== Deploy the Mission Analytics Service as a Serverless Application
+
+. Build the application, create an image and push to OpenShift. The image is tagged with the `serverless` tag:
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-mission-analytics/mission-analytics:serverless .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-mission-analytics/mission-analytics:serverless
+----
+
+. Scale down the mission analytics deployment to zero pods, or delete it altogether:
++
+----
+$ oc scale dc mission-analytics-service --replicas=0 -n user1-mission-analytics 
+----
+
+. Deploy the mission analytics service as a serverless application. All this takes is to create a Knative _Service_ custom resource which refers to the image of the application you want to deploy. +
+Knative Service custom resources don't (yet) understand the concept of a configmap, so all external configuration has to be provided as environment variables. +
+Create and deploy the Service custom resource:
++
+----
+$ echo '
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: mission-analytics-serverless
+spec:
+  template:
+    metadata:
+      name: mission-analytics-serverless-1
+    spec:
+      containers:
+        - image: image-registry.openshift-image-registry.svc:5000/user1-mission-analytics/mission-analytics:serverless
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka-cluster-kafka-bootstrap.user1-er-demo.svc:9092
+            - name: MP_MESSAGING_OUTGOING_MISSION_DATA_TOPIC
+              value: topic-mission-data
+            - name: INCIDENT_SERVICE_MP_REST_URL
+              value: http://incident-service.user1-er-demo.svc:8080
+            - name: RESPONDER_SERVICE_MP_REST_URL
+              value: http://responder-service.user1-er-demo.svc:8080
+            - name: QUARKUS_LOG_CONSOLE_LEVEL
+              value: DEBUG
+' | oc create -f - -n user1-mission-analytics
+----
++
+.Expected Output:
+----
+service.serving.knative.dev/mission-analytics-serverless created
+----
+
+. Verify the successful installation of the custom resource:
++
+----
+$ oc get service.serving.knative.dev mission-analytics-serverless -n user1-mission-analytics --template='{{range .status.conditions}}{{printf "%s=%s\n" .type .status}}{{end}}'
+----
++
+.Expected Output
+----
+ConfigurationsReady=True
+Ready=True
+RoutesReady=True
+----
+
+. As a result of the creation of the custom resource, a new pod for the mission analytics service is created in the `user1-mission-analytics` namespace:
++
+----
+$ oc get pods -n user1-mission-analytics
+----
++
+.Sample output
+----
+NAME                                                         READY   STATUS      RESTARTS   AGE
+kafka-consumer-app-1-22gfs                                   1/1     Running     0          18h
+mission-analytics-serverless-1-deployment-6b57c466d7-vvz9f   2/2     Running     0          47s
+----
++
+As the application does not get any load at the moment, the serverless infrastructure will scale the service down to zero and take the pod down after about 60 seconds.
+
+. At this point you can test the service by sending a payload to the service over HTTP.
+* Obtain the external URL to the service. As a result of deploying the service, a route is created in the `knative-serving-ingress` namespace:
++
+----
+$ oc get route -n knative-serving-ingress
+----
++
+.Sample output
+----
+NAME                                                      HOST/PORT                                                                                         PATH   SERVICES   PORT    TERMINATION   WILDCARD
+route-d31618c9-93b6-4ba2-aaf3-040148301477-386235333832   mission-analytics-serverless-user1-mission-analytics.apps.cluster-03b3.03b3.example.opentlc.com          kourier    http2   edge/Allow    None
+----
++
+The route is managed by a Knative `route.serving.knative.dev` resource. Get the URL to the route:
++
+----
+$ MISSION_ANALYTICS_URL=$(oc get route.serving.knative.dev mission-analytics-serverless -n user1-mission-analytics --template='{{ .status.url }}')
+----
+* Call the `POST /` endpoint of the serverless service with a payload representing a _MissionCreatedEvent_. Expect the service to be triggered and return a `200 OK` HTTP return code.
++
+----
+$ echo '
+{ "id": "f86cde1f-4934-4ea4-9223-ff4764909074",
+  "messageType": "MissionCreatedEvent",
+  "body": {}
+}
+' | tee /tmp/mission-created.json
+$ curl -v -X POST -H "Content-type: application/json" -d@/tmp/mission-created.json $MISSION_ANALYTICS_URL
+----
++
+.Sample output
+----
+*   Trying 18.194.125.175:80...
+* Connected to mission-analytics-serverless-user1-mission-analytics.apps.cluster-03b3.03b3.example.opentlc.com (18.194.125.175) port 80 (#0)
+> POST / HTTP/1.1
+> Host: mission-analytics-serverless-user1-mission-analytics.apps.cluster-03b3.03b3.example.opentlc.com
+> User-Agent: curl/7.69.1
+> Accept: */*
+> Content-type: application/json
+> Content-Length: 99
+> 
+* upload completely sent off: 99 out of 99 bytes
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 200 OK
+< content-length: 0
+< date: Sun, 02 Aug 2020 08:21:23 GMT
+< x-envoy-upstream-service-time: 185
+< server: envoy
+< set-cookie: 303b15de30ae12f7ccd0b87bdbab350a=265c1e589e8c54da118fdccf5a291ea8; path=/; HttpOnly
+< 
+* Connection #0 to host mission-analytics-serverless-user1-mission-analytics.apps.cluster-03b3.03b3.example.opentlc.com left intact
+----
+* Check the logs of the mission analytics pod in the `user1-mission-analytics` namespace. You need to do this within 60 seconds after the `curl` call, before the pod is taken down. Expect to see the log for the processing of the payload:
++
+----
+2020-08-02 08:21:23,849 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-1) ce-id: null
+2020-08-02 08:21:23,849 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-1) ce-source: null
+2020-08-02 08:21:23,850 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-1) ce-specversion: null
+2020-08-02 08:21:23,850 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-1) ce-time: null
+2020-08-02 08:21:23,850 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-1) ce-type: null
+2020-08-02 08:21:23,850 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-1) Processing payload { "id": "f86cde1f-4934-4ea4-9223-ff4764909074",  "messageType": "MissionCreatedEvent",  "body": {}}
+2020-08-02 08:21:23,998 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-1) Ignoring message with MessageType MissionCreatedEvent
+----
+
+== Add Knative Eventing
+
+=== Add Knative Eventing with Source and Sink
+
+At this point the mission analytics service is deployed as a serverless service, and can be called through REST. However, what you really want is the mission analytics service to be triggered by _MissionCompletedEvent_ messages posted on the `topic-mission-event` Kafka topic. This is where Knative Eventing comes in.
+
+. Create a _KnativeEventingKafka_ custom resource in the `knative-eventing`. This custom resource triggers the installation of the Knative Kafka components, and enables the Knative Kafka Eventing source and channel.
++
+----
+$ echo '
+apiVersion: operator.serverless.openshift.io/v1alpha1
+kind: KnativeKafka
+metadata:
+  name: knative-kafka
+spec:
+  channel:
+    bootstrapServers: kafka-cluster-kafka-bootstrap.user1-er-demo:9092
+    enabled: true
+  source:
+    enabled: true
+' | oc create -f - -n knative-eventing
+----
++
+.Output
+----
+knativekafka.operator.serverless.openshift.io/knative-kafka created
+----
+
+. Verify the successful installation of Knative Kafka Eventing:
++
+----
+$ oc get knativekafka knative-kafka -n knative-eventing --template='{{range .status.conditions}}{{printf "%s=%s\n" .type .status}}{{end}}'
+----
++
+.Expected Output
+----
+DeploymentsAvailable=True
+InstallSucceeded=True
+Ready=True
+----
+
+. Notice that the installation of the KnativeEventingKafka custom resource created a number of additional pods in the `knative-eventing` namespace. The pods are prefixed with `kafka-`:
++
+----
+$ oc get pods -n knative-eventing
+----
++
+.Sample Output
+----
+NAME                                               READY   STATUS      RESTARTS   AGE
+eventing-controller-848bcbd4f9-622kb               1/1     Running     0          21m
+eventing-webhook-78dcf96448-5bxwf                  1/1     Running     0          21m
+imc-controller-8559ff856b-klbgt                    1/1     Running     0          21m
+imc-dispatcher-575c7fcd8d-57j7f                    1/1     Running     0          21m
+kafka-ch-controller-85f879d577-n6jhw               1/1     Running     0          49s
+kafka-ch-dispatcher-55d76d7db8-prw9l               1/1     Running     0          49s
+kafka-controller-manager-bc994c465-87wk4           1/1     Running     0          45s
+kafka-webhook-54646f474f-kgpwn                     1/1     Running     0          47s
+mt-broker-controller-56857cccc5-jck5p              1/1     Running     0          21m
+mt-broker-filter-784b7db965-2jzr8                  1/1     Running     0          21m
+mt-broker-ingress-6b9f847866-7wk2r                 1/1     Running     0          21m
+sugar-controller-594784974b-gsbr2                  1/1     Running     0          21m
+v0.17.0-pingsource-cleanup-eventing-0.17.2-jtk2k   0/1     Completed   0          21m
+----
+
+. Create a _KafkaSource_ custom resource in the `user1-mission-analytics` namespace. The source is configured to consume messages from the `topic-mission-event` topic and deliver them to the `mission-analytics-serverless` Knative service:
++
+----
+$ echo '
+apiVersion: sources.knative.dev/v1beta1
+kind: KafkaSource
+metadata:
+  name: mission-analytics-source
+spec:
+  consumerGroup: mission-analytics-serverless
+  bootstrapServers: 
+   - kafka-cluster-kafka-bootstrap.user1-er-demo:9092 
+  topics: 
+   - topic-mission-event
+  sink: 
+    ref:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      name: mission-analytics-serverless
+' | oc create -f - -n user1-mission-analytics
+----
++
+.Output
+----
+kafkasource.sources.knative.dev/mission-analytics-source created
+----
+
+. Verify the successful installation of the Kafka Knative source:
++
+----
+$ oc get kafkasource mission-analytics-source -n user1-mission-analytics --template='{{range .status.conditions}}{{printf "%s=%s\n" .type .status}}{{end}}'
+----
++
+.Expected Output
+----
+Deployed=True
+Ready=True
+SinkProvided=True
+----
+
+. At this point you are ready to test the mission analytics service. In a browser window, navigate to the Emergency Response application console, log in as _incident_commander_, and start a simulation.
+
+. Check the pods in the `user1-mission-analytics` namespace. Notice that a pod of the mission analytics service is created.
++
+----
+$ oc get pods -n user1-mission-analytics
+----
++
+.Sample output
+----
+NAME                                                              READY   STATUS    RESTARTS   AGE
+kafka-consumer-app-1-22gfs                                        1/1     Running   0          24h
+kafkasource-mission-analyt-2bc67f3a-b42c-413e-b0d3-256d9506svwv   1/1     Running   0          6m13s
+mission-analytics-serverless-1-deployment-8659b9c4c8-lblps        2/2     Running   0          1m11s
+----
+
+. Check the logs of the mission analytics service pod. Expect to see a log statement for every message the pod receives from the `topic-mission-event` topic.
++
+----
+2020-08-02 13:58:20,295 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-id: partition:4/offset:44
+2020-08-02 13:58:20,296 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-source: /apis/v1/namespaces/user1-mission-analytics/kafkasources/mission-analytics-source#topic-mission-event
+2020-08-02 13:58:20,296 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-specversion: 1.0
+2020-08-02 13:58:20,296 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-time: 2020-08-02T13:58:20.287Z
+2020-08-02 13:58:20,296 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-type: dev.knative.kafka.event
+2020-08-02 13:58:20,296 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-key: 231313d9-6348-4304-9910-f9c49870e379
+2020-08-02 13:58:20,296 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) Processing payload {"id":"9468e7d3-c6de-4e75-a454-509e92817ba2","invokingService":"MissionService","timestamp":1596376700287,"messageType":"MissionCompletedEvent","body":{"id":"a562657b-31cb-46b7-8e56-2b7688d49612","incidentId":"231313d9-6348-4304-9910-f9c49870e379","responderId":"175","responderStartLat":34.17070,"responderStartLong":-77.94840,"incidentLat":34.23958,"incidentLong":-77.78871,"destinationLat":34.2461,"destinationLong":-77.9519,"responderLocationHistory":[{"lat":34.1842,"lon":-77.9487,"timestamp":1596376450316},{"lat":34.1923,"lon":-77.9409,"timestamp":1596376460302},{"lat":34.195,"lon":-77.9249,"timestamp":1596376470324},{"lat":34.1977,"lon":-77.9089,"timestamp":1596376480322},{"lat":34.2011,"lon":-77.8884,"timestamp":1596376490307},{"lat":34.2118,"lon":-77.882,"timestamp":1596376500309},{"lat":34.2165,"lon":-77.8667,"timestamp":1596376510309},{"lat":34.2211,"lon":-77.8514,"timestamp":1596376520299},{"lat":34.2258,"lon":-77.8361,"timestamp":1596376530335},{"lat":34.2243,"lon":-77.824,"timestamp":1596376540297},{"lat":34.2329,"lon":-77.8165,"timestamp":1596376550297},{"lat":34.2356,"lon":-77.8025,"timestamp":1596376560298},{"lat":34.245,"lon":-77.7959,"timestamp":1596376570298},{"lat":34.2422,"lon":-77.794,"timestamp":1596376580305},{"lat":34.247,"lon":-77.8013,"timestamp":1596376590305},{"lat":34.2524,"lon":-77.8162,"timestamp":1596376600297},{"lat":34.2542,"lon":-77.8266,"timestamp":1596376610303},{"lat":34.2573,"lon":-77.8395,"timestamp":1596376620296},{"lat":34.2516,"lon":-77.8543,"timestamp":1596376630295},{"lat":34.2483,"lon":-77.8697,"timestamp":1596376640297},{"lat":34.2483,"lon":-77.886,"timestamp":1596376650285},{"lat":34.2483,"lon":-77.9023,"timestamp":1596376660386},{"lat":34.2483,"lon":-77.9186,"timestamp":1596376670291},{"lat":34.2484,"lon":-77.9349,"timestamp":1596376680293},{"lat":34.2484,"lon":-77.9477,"timestamp":1596376690295},{"lat":34.2462,"lon":-77.9521,"timestamp":1596376700287}],"status":"COMPLETED","steps":[{"lat":34.1707,"lon":-77.9484,"wayPoint":false,"destination":false},{"lat":34.1910,"lon":-77.9488,"wayPoint":false,"destination":false},{"lat":34.2011,"lon":-77.8884,"wayPoint":false,"destination":false},{"lat":34.2103,"lon":-77.8868,"wayPoint":false,"destination":false},{"lat":34.2277,"lon":-77.8297,"wayPoint":false,"destination":false},{"lat":34.2243,"lon":-77.8240,"wayPoint":false,"destination":false},{"lat":34.2268,"lon":-77.8241,"wayPoint":false,"destination":false},{"lat":34.2329,"lon":-77.8165,"wayPoint":false,"destination":false},{"lat":34.2323,"lon":-77.8049,"wayPoint":false,"destination":false},{"lat":34.2450,"lon":-77.7959,"wayPoint":false,"destination":false},{"lat":34.2445,"lon":-77.7936,"wayPoint":false,"destination":false},{"lat":34.2422,"lon":-77.7940,"wayPoint":true,"destination":false},{"lat":34.2422,"lon":-77.7940,"wayPoint":false,"destination":false},{"lat":34.2405,"lon":-77.7958,"wayPoint":false,"destination":false},{"lat":34.2445,"lon":-77.7936,"wayPoint":false,"destination":false},{"lat":34.2450,"lon":-77.7959,"wayPoint":false,"destination":false},{"lat":34.2561,"lon":-77.8264,"wayPoint":false,"destination":false},{"lat":34.2542,"lon":-77.8266,"wayPoint":false,"destination":false},{"lat":34.2597,"lon":-77.8331,"wayPoint":false,"destination":false},{"lat":34.2483,"lon":-77.8629,"wayPoint":false,"destination":false},{"lat":34.2484,"lon":-77.9477,"wayPoint":false,"destination":false},{"lat":34.2467,"lon":-77.9488,"wayPoint":false,"destination":false},{"lat":34.2463,"lon":-77.9514,"wayPoint":false,"destination":false},{"lat":34.2462,"lon":-77.9521,"wayPoint":false,"destination":true}]}}
+2020-08-02 13:59:00,292 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-id: partition:12/offset:47
+2020-08-02 13:59:00,292 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-source: /apis/v1/namespaces/user1-mission-analytics/kafkasources/mission-analytics-source#topic-mission-event
+2020-08-02 13:59:00,292 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-specversion: 1.0
+2020-08-02 13:59:00,292 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-time: 2020-08-02T13:59:00.283Z
+2020-08-02 13:59:00,292 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-type: dev.knative.kafka.event
+2020-08-02 13:59:00,292 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) ce-key: ba8aba97-a2b4-4b3d-928e-f21f9f167501
+2020-08-02 13:59:00,292 DEBUG [com.red.erd.ana.con.MissionSource] (executor-thread-4) Processing payload {"id":"06e1054e-b041-40a3-a93c-6e9dfbbd62e1","invokingService":"MissionService","timestamp":1596376740283,"messageType":"MissionCompletedEvent","body":{"id":"30993bb3-dd33-4f5d-b4e8-5cfeacb25757","incidentId":"ba8aba97-a2b4-4b3d-928e-f21f9f167501","responderId":"174","responderStartLat":34.05810,"responderStartLong":-77.88850,"incidentLat":34.21021,"incidentLong":-77.82894,"destinationLat":34.1706,"destinationLong":-77.949,"responderLocationHistory":[{"lat":34.0461,"lon":-77.8877,"timestamp":1596376470311},{"lat":34.036,"lon":-77.8922,"timestamp":1596376480313},{"lat":34.0485,"lon":-77.8933,"timestamp":1596376490302},{"lat":34.062,"lon":-77.8928,"timestamp":1596376500297},{"lat":34.0755,"lon":-77.8923,"timestamp":1596376510289},{"lat":34.089,"lon":-77.8918,"timestamp":1596376520294},{"lat":34.1025,"lon":-77.8912,"timestamp":1596376530332},{"lat":34.116,"lon":-77.8907,"timestamp":1596376540292},{"lat":34.1295,"lon":-77.8901,"timestamp":1596376550292},{"lat":34.143,"lon":-77.8895,"timestamp":1596376560294},{"lat":34.1565,"lon":-77.889,"timestamp":1596376570292},{"lat":34.17,"lon":-77.8884,"timestamp":1596376580299},{"lat":34.1835,"lon":-77.8879,"timestamp":1596376590301},{"lat":34.197,"lon":-77.8873,"timestamp":1596376600294},{"lat":34.2103,"lon":-77.8868,"timestamp":1596376610300},{"lat":34.2107,"lon":-77.8705,"timestamp":1596376620293},{"lat":34.2112,"lon":-77.8542,"timestamp":1596376630290},{"lat":34.2117,"lon":-77.8357,"timestamp":1596376640294},{"lat":34.2104,"lon":-77.8297,"timestamp":1596376650291},{"lat":34.2115,"lon":-77.8452,"timestamp":1596376660383},{"lat":34.2111,"lon":-77.8615,"timestamp":1596376670288},{"lat":34.2107,"lon":-77.8778,"timestamp":1596376680325},{"lat":34.2023,"lon":-77.8882,"timestamp":1596376690298},{"lat":34.1951,"lon":-77.902,"timestamp":1596376700283},{"lat":34.1879,"lon":-77.9158,"timestamp":1596376710283},{"lat":34.1806,"lon":-77.9295,"timestamp":1596376720283},{"lat":34.1734,"lon":-77.9433,"timestamp":1596376730283},{"lat":34.1707,"lon":-77.9484,"timestamp":1596376740283}],"status":"COMPLETED","steps":[{"lat":34.0581,"lon":-77.8885,"wayPoint":false,"destination":false},{"lat":34.0534,"lon":-77.8845,"wayPoint":false,"destination":false},{"lat":34.0360,"lon":-77.8922,"wayPoint":false,"destination":false},{"lat":34.0364,"lon":-77.8938,"wayPoint":false,"destination":false},{"lat":34.2103,"lon":-77.8868,"wayPoint":false,"destination":false},{"lat":34.2117,"lon":-77.8357,"wayPoint":false,"destination":false},{"lat":34.2104,"lon":-77.8318,"wayPoint":false,"destination":false},{"lat":34.2108,"lon":-77.8316,"wayPoint":false,"destination":false},{"lat":34.2103,"lon":-77.8303,"wayPoint":false,"destination":false},{"lat":34.2104,"lon":-77.8297,"wayPoint":true,"destination":false},{"lat":34.2104,"lon":-77.8297,"wayPoint":false,"destination":false},{"lat":34.2103,"lon":-77.8303,"wayPoint":false,"destination":false},{"lat":34.2108,"lon":-77.8316,"wayPoint":false,"destination":false},{"lat":34.2104,"lon":-77.8318,"wayPoint":false,"destination":false},{"lat":34.2117,"lon":-77.8357,"wayPoint":false,"destination":false},{"lat":34.2105,"lon":-77.8867,"wayPoint":false,"destination":false},{"lat":34.2023,"lon":-77.8882,"wayPoint":false,"destination":false},{"lat":34.1707,"lon":-77.9484,"wayPoint":false,"destination":true}]}}
+----
++
+Notice the values of the CloudEvent specific HTTP headers.
+
+. Check the logs of the Kafka consumer application pod. Expect to see a log statement for messages produced by the serverless mission analytics service to the `topic-mission-data` topic.
++
+----
+2020-08-02 13:58:20,312 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-124) Consumed message from topic 'topic-mission-data', partition '0', offset '120'
+2020-08-02 13:58:20,312 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-124)     Headers: 
+2020-08-02 13:58:20,312 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-124)     Message key: a562657b-31cb-46b7-8e56-2b7688d49612
+2020-08-02 13:58:20,313 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-124)     Message value: {"missionId":"a562657b-31cb-46b7-8e56-2b7688d49612","incidentId":"231313d9-6348-4304-9910-f9c49870e379","incidentName":"Leah Hernandez","incidentLatitude":34.23958,"incidentLongitude":-77.78871,"incidentNumberOfPeople":8,"incidentMedicalNeeded":false,"incidentTimestamp":1596376348703,"responderId":"175","responderName":"Aiden Wood","destinationLatitude":34.2461,"destinationLongitude":-77.9519,"missionCompetedTimestamp":1596376700287}
+2020-08-02 13:59:00,308 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-125) Consumed message from topic 'topic-mission-data', partition '0', offset '121'
+2020-08-02 13:59:00,308 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-125)     Headers: 
+2020-08-02 13:59:00,308 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-125)     Message key: 30993bb3-dd33-4f5d-b4e8-5cfeacb25757
+2020-08-02 13:59:00,308 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-125)     Message value: {"missionId":"30993bb3-dd33-4f5d-b4e8-5cfeacb25757","incidentId":"ba8aba97-a2b4-4b3d-928e-f21f9f167501","incidentName":"Caleb Cox","incidentLatitude":34.21021,"incidentLongitude":-77.82894,"incidentNumberOfPeople":7,"incidentMedicalNeeded":false,"incidentTimestamp":1596376350703,"responderId":"174","responderName":"Vivian Sanchez","destinationLatitude":34.1706,"destinationLongitude":-77.949,"missionCompetedTimestamp":1596376740283}
+----
+. Once the Emergency Response application simulation run is over, notice that the mission analytics service pod is removed and the service is scaled down to zero.
+
+=== Knative Eventing with Channels and Subscriptions
+
+In the previous section, you directly tied the _KafkaSource_ to the serverless service. In this section you leverage the concepts of Knative _Channel_ and _Subscription_ to provide a more loosely coupled association between the event source and the event consumers.
+
+. Delete the KafkaSource you created in the previous lab:
++
+----
+$ oc delete kafkasource mission-analytics-source -n user1-mission-analytics
+----
+
+. Create a Knative _KafkaChannel_ in the `user1-mission-analytics` namespace. For every channel, a Kafka topic is created, with the number of partitions and the replication factor as specified in the custom resource. The kafka broker address is specified in the _KnativeEventingKafka_ which was created earlier.
++
+----
+$ echo '
+apiVersion: messaging.knative.dev/v1beta1
+kind: KafkaChannel
+metadata:
+  name: mission-analytics-channel
+spec:
+  numPartitions: 15
+  replicationFactor: 3
+' | oc create -f - -n user1-mission-analytics
+----
++
+.Output
+----
+kafkachannel.messaging.knative.dev/mission-analytics-channel created
+----
+
+. Verify that the Kafka Knative channel has been created successfully:
++
+----
+$ oc get kafkachannel mission-analytics-channel -n user1-mission-analytics --template='{{range .status.conditions}}{{printf "%s=%s\n" .type .status}}{{end}}'
+----
++
+.Expected Output
+----
+Addressable=True
+ChannelServiceReady=True
+ConfigurationReady=True
+DispatcherReady=True
+EndpointsReady=True
+Ready=True
+ServiceReady=True
+TopicReady=True
+----
+
+. Verify the topics on the Kafka cluster. Notice the creation of a topic for the Knative channel:
++
+----
+$ oc get kafkatopic -n user1-er-demo | grep mission-analytics
+----
++
+.Expected Output
+----
+knative-messaging-kafka.user1-mission-analytics.mission-analytics-channel            15           3
+----
+
+. Create a Knative _Subscription_ which binds the mission analytics serverless service to the Knative Kafka channel:
++
+----
+$ echo '
+apiVersion: messaging.knative.dev/v1
+kind: Subscription
+metadata:
+  name: mission-analytics-subscription
+spec:
+  channel:
+    apiVersion: messaging.knative.dev/v1beta1
+    kind: KafkaChannel
+    name: mission-analytics-channel
+  subscriber:
+    ref:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      name: mission-analytics-serverless
+' | oc create -f - -n user1-mission-analytics
+----
++
+.Output
+----
+subscription.messaging.knative.dev/mission-analytics-subscription created
+----
+
+. Verify that the Knative Subscription has been successfully created:
++
+----
+$ oc get subscription.messaging.knative.dev mission-analytics-subscription -n user1-mission-analytics --template='{{range .status.conditions}}{{printf "%s=%s\n" .type .status}}{{end}}'
+----
++
+.Expected Output
+----
+AddedToChannel=True
+ChannelReady=True
+Ready=True
+ReferencesResolved=True
+----
+
+. Finally create a _KafkaSource_ custom resource in the `user1-mission-analytics` namespace bound to the Knative Kafka channel:
++
+----
+$ echo '
+apiVersion: sources.knative.dev/v1beta1
+kind: KafkaSource
+metadata:
+  name: mission-analytics-source
+spec:
+  consumerGroup: mission-analytics-serverless
+  bootstrapServers: 
+   - kafka-cluster-kafka-bootstrap.user1-er-demo:9092 
+  topics: 
+   - topic-mission-event
+  sink: 
+    ref:
+      apiVersion: messaging.knative.dev/v1beta1
+      kind: KafkaChannel
+      name: mission-analytics-channel
+' | oc create -f - -n user1-mission-analytics
+----
++
+.Output
+----
+kafkasource.sources.knative.dev/mission-analytics-source created
+----
+
+. Verify the successful installation of the Knative KafkaSource:
++
+----
+$ oc get kafkasource mission-analytics-source -n user1-mission-analytics --template='{{range .status.conditions}}{{printf "%s=%s\n" .type .status}}{{end}}'
+----
++
+.Expected Output
+----
+Deployed=True
+Ready=True
+SinkProvided=True
+----
+
+. Test the mission analytics service. In a browser window, navigate to the Emergency Response application console, log in as _incident_commander_, and start a simulation. +
+* Check the pods in the `user1-mission-analytics` namespace. Notice that a pod of the mission analytics service is created.
+* Check the logs of the mission analytics service pod. Expect to see a log statement for every message the pod consumes from the `topic-mission-event` topic.
+* Check the logs of the kafka consumer application pod. Expect to see a log statement for messages produced by the serverless mission analytics service to the `topic-mission-data` topic.
+
+=== Knative Eventing with Response Message
+
+The mission analytics service sends a Kafka message to the `topic-mission-data` topic for every _MissionCompletedEvent_ it receives from the Knative Kafka channel. +
+But rather than sending the message itself to the topic, the service can send a reply to another Knative Kafka channel, from where it can be consumed by other services, serverless or not.
+
+. The first step to achieve this consists in refactoring the `MissionSource` class in the mission analytics source code to return a CloudEvent response.
+* In the `MissionSource` class remove the `missionProcessor` class variable.
+* Remove the `produceMission` method.
+* In the `process` method, remove the reference to the `missionProcessor`.
+* In the `process` method, change the return statement to the following:
++
+----
+        return Response.ok().entity(Json.encode(mission)).header("Ce-Id", UUID.randomUUID().toString())
+                .header("Ce-SpecVersion", "1.0")
+                .header("Ce-Type", "dev.knative.mission.data")
+                .header("Ce-Source", "urn:knative/eventing/mission/mission-data")
+                .header("Content-Type", "application/json").build();
+----
++
+Notice the CloudEvent specific headers which qualify the response as a CloudEvent that can be handled by Knative Eventing.
+
+. In the `src/main/resources/application.properties`, remove or comment out the configuration settings for the outgoing MicroProfile Reactive Messaging channel.
++
+----
+# Configure the Kafka sink
+#mp.messaging.outgoing.mission-data.connector=smallrye-kafka
+#mp.messaging.outgoing.mission-data.key.serializer=org.apache.kafka.common.serialization.StringSerializer
+#mp.messaging.outgoing.mission-data.value.serializer=org.apache.kafka.common.serialization.StringSerializer
+#mp.messaging.outgoing.mission-data.acks=1
+----
+
+. Build the application, create an image and push to OpenShift.
++
+----
+$ mvn clean package
+$ REGISTRY_URL=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
+$ podman build -f docker/Dockerfile -t ${REGISTRY_URL}/user1-mission-analytics/mission-analytics:serverless .
+$ podman login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY_URL}
+$ podman push ${REGISTRY_URL}/user1-mission-analytics/mission-analytics:serverless
+----
+
+. Delete the existing serverless mission analytics service.
++
+----
+$ oc delete service.serving.knative.dev mission-analytics-serverless -n user1-mission-analytics
+----
+
+. Create the serverless mission analytics service. Notice the absence of MicroProfile Reactive Messaging related environment variables.
++
+----
+$ echo '
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: mission-analytics-serverless
+spec:
+  template:
+    metadata:
+      name: mission-analytics-serverless-1
+    spec:
+      containers:
+        - image: image-registry.openshift-image-registry.svc:5000/user1-mission-analytics/mission-analytics:serverless
+          env:
+            - name: INCIDENT_SERVICE_MP_REST_URL
+              value: http://incident-service.user1-er-demo.svc:8080
+            - name: RESPONDER_SERVICE_MP_REST_URL
+              value: http://responder-service.user1-er-demo.svc:8080
+            - name: QUARKUS_LOG_CONSOLE_LEVEL
+              value: DEBUG
+' | oc apply -f - -n user1-mission-analytics
+----
+
+. Create a Knative Kafka channel for the response CloudEvent in the `user1-mission-analytics` namespace
++
+----
+$ echo '
+apiVersion: messaging.knative.dev/v1beta1
+kind: KafkaChannel
+metadata:
+  name: mission-data-channel
+spec:
+  numPartitions: 15
+  replicationFactor: 3
+' | oc create -f - -n user1-mission-analytics
+----
++
+.Output
+----
+kafkachannel.messaging.knative.dev/mission-analytics-channel-reply created
+----
+
+. Delete the existing Knative subscription:
++
+----
+$ oc delete subscription.messaging.knative.dev mission-analytics-subscription -n user1-mission-analytics
+----
+
+. Create a Knative subscription which includes the configuration for the reply CloudEvents from the mission analytics service. The reply message is sent to the `mission-data-channel` Kafka channel.
++
+----
+$ echo '
+apiVersion: messaging.knative.dev/v1
+kind: Subscription
+metadata:
+  name: mission-analytics-subscription
+spec:
+  channel:
+    apiVersion: messaging.knative.dev/v1beta1
+    kind: KafkaChannel
+    name: mission-analytics-channel
+  subscriber:
+    ref:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      name: mission-analytics-serverless
+  reply:
+    ref:
+      apiVersion: messaging.knative.dev/v1beta1
+      kind: KafkaChannel
+      name: mission-data-channel
+
+' | oc create -f - -n user1-mission-analytics
+----
++
+.Output
+----
+subscription.messaging.knative.dev/mission-analytics-subscription created
+----
+
+. Check the Kafka topics. Notice the new topic for the `mission-data-channel` Knative Kafka channel:
++
+----
+$ oc get kafkatopic -n user1-er-demo | grep knative-messaging
+----
++
+.Output
+----
+knative-messaging-kafka.user1-mission-analytics.mission-analytics-channel                        15        3
+knative-messaging-kafka.user1-mission-analytics.mission-data-channel                             15        3
+----
+
+. The responses from the mission analytics service are expected to be sent to the `knative-messaging-kafka.user1-mission-analytics.mission-data-channel` topic. +
+Reconfigure the Kafka consumer app in the `user1-mission-analytics` namespace to consume messages from that topic.
+* Edit the `kafka-consumer-app` configmap in the `user1-mission-analytics` namespace:
++
+----
+$ oc edit configmap kafka-consumer-app -n user1-mission-analytics 
+----
++
+Change the `mp.messaging.incoming.channel.topic` setting to point to the Knative Kafka channel topic:
++
+----
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  [...]
+data:
+  application.properties: >-
+    mp.messaging.incoming.channel.bootstrap.servers=kafka-cluster-kafka-bootstrap.user1-er-demo.svc:9092
+
+    mp.messaging.incoming.channel.topic=knative-messaging-kafka.user1-mission-analytics.mission-data-channel
+
+    mp.messaging.incoming.channel.group.id=kafka-consumer-app
+----
+* Delete the existing Kafka consumer pod to force a redeployment of the application.
+
+. Test the mission analytics service. In a browser window, navigate to the Emergency Response application console, log in as _incident_commander_, and start a simulation. +
+* Check the pods in the `user1-mission-analytics` namespace. Notice that a pod of the mission analytics service is created.
+* Check the logs of the mission analytics service pod. Expect to see a log statement for every message the pod consumes from the `topic-mission-event` topic.
+* Check the logs of the Kafka consumer application pod. Expect to see a log statement for the CloudEvent responses from the mission analytics service:
++
+----
+2020-08-02 19:47:00,316 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-18) Consumed message from topic 'knative-messaging-kafka.user1-mission-analytics.mission-data-channel', partition '2', offset '2'
+2020-08-02 19:47:00,316 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-18)     Headers: content-type: application/json, ce_id: 97f41d99-06f5-4d04-8b36-36b0a9aee7d0, ce_source: urn:knative/eventing/mission/mission-data, ce_specversion: 1.0, ce_type: dev.knative.mission.data, ce_time: 2020-08-02T19:47:00.312177715Z, ce_knativehistory: mission-data-channel-kn-channel.user1-mission-analytics.svc.cluster.local
+2020-08-02 19:47:00,316 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-18)     Message key: null
+2020-08-02 19:47:00,317 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-18)     Message value: {"missionId":"1849d9c9-a8ad-4432-8ea7-a62bfe3a5aba","incidentId":"bce26836-d01e-4a28-85d1-a0bef5ddd1db","incidentName":"Daniel Alexander","incidentLatitude":34.18446,"incidentLongitude":-77.84466,"incidentNumberOfPeople":9,"incidentMedicalNeeded":false,"incidentTimestamp":1596397317356,"responderId":"232","responderName":"Parker Wright","destinationLatitude":34.1706,"destinationLongitude":-77.949,"missionCompetedTimestamp":1596397620282}
+2020-08-02 19:49:06,034 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-19) Consumed message from topic 'knative-messaging-kafka.user1-mission-analytics.mission-data-channel', partition '10', offset '0'
+2020-08-02 19:49:06,035 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-19)     Headers: ce_source: urn:knative/eventing/mission/mission-data, ce_type: dev.knative.mission.data, ce_id: e872bc81-1922-4934-8c8b-53e5c3c3ce69, ce_specversion: 1.0, content-type: application/json, ce_time: 2020-08-02T19:49:06.006454011Z, ce_knativehistory: mission-data-channel-kn-channel.user1-mission-analytics.svc.cluster.local
+2020-08-02 19:49:06,035 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-19)     Message key: null
+2020-08-02 19:49:06,035 INFO  [com.red.eme.res.kaf.KafkaRecordConsumer] (Thread-19)     Message value: {"missionId":"9618f755-9244-41b7-9d86-57d61e3167a3","incidentId":"dc4d7e1e-1c22-41ce-918f-18ba45624b09","incidentName":"Christopher Jones","incidentLatitude":34.24404,"incidentLongitude":-77.84830,"incidentNumberOfPeople":1,"incidentMedicalNeeded":false,"incidentTimestamp":1596397321357,"responderId":"230","responderName":"Oliver Hill","destinationLatitude":34.2461,"destinationLongitude":-77.9519,"missionCompetedTimestamp":1596397730283}
+----
++
+Notice the Cloud Event headers which are passed as Kafka Message headers. The message payload corresponds to the JSON representation of the `Mission` object instance.

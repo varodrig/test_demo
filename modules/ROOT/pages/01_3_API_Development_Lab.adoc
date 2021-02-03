@@ -1,0 +1,1094 @@
+:noaudio:
+:scrollbar:
+:toc2:
+:linkattrs:
+:data-uri:
+
+== API Design Lab
+
+.Prerequisites
+* Access to the Red Hat^(R)^ OpenShift^(R)^ Container Platform 4.x cluster
+* Prerequisites for local workstation:
+** Java development environment for Java 11, including an IDE
+** Development tools: git, Maven (version 3.6.3)
+** Tools for container image management (Docker, Podman)
+** API Testing tools (Postman, SoapUI)
+** Ansible (version >= 2.9.0)
+** Openshift `oc` CLI client, version 4.6.x
+
+.Goals
+* Explore API first development, and test driven development for REST APIs
+* Explore contract testing for REST APIs
+
+:numbered:
+
+== Introduction
+
+An API (Application Programming Interface) defines how an application will communicate with other applications. As an example, for an application that exposes REST endpoints, the API consists of the sum of all the REST operations exposed by the application. 
+When adopting an API first design, the contract for how your application communicates with other programs is defined and agreed upon before starting the implementation phase of the application.
+The API first design approach has several advantages:
+
+* Development teams can work in parallel. Once the contract is established, different development teams can start to work on all sides of an API simultaneously. Developers of consumers of the API don't have to wait until the implementation is released.
+* Increased speed to market. Much of the process of building APIs can be automated using tools that allow import of API definition files, which allows auto-generation of API documentation, implementation code skeletons, and mock APIs.
+* Improved developer experience: API first design creates an API that is well-designed, well documented, and consistent, which is essential to a positive developer experience.
+
+The _OpenAPI Specification_ (formerly known as Swagger Specification) is an API description format for REST APIs. An OpenAPI file allows you to describe your entire API, including available endpoints (`/users`), and operations on each endpoint (`GET /users, POST /users`), operation parameters and expected output for each operation, as well as authentication methods, license, terms of use, contact information etc... +
+OpenAPI specification documents are written in JSON or YAML.
+
+Once designed, the OpenAPI specification can drive the implementation of the API forward in different ways: automatic generation of servers side stubs and client side libraries, generation of API documentation, creation of test suites etc...
+
+In this lab you will define an OpenAPI specification using Apicurio (https://www.apicur.io), and generate a test suite for the API using PostMan (https://www.postman.com). The test suite is used during the development phase to ensure the API implementation follows the specification.
+
+Parallel API development is made possible through the use of API mock servers. A mock API server or mock server API imitates a real API server by providing realistic mock API responses to requests. It allows the development and testing of client side consumers of the API, even when the real API is still under development. API mocking also allows to gather feedback from developers in the early stages of development of the API, when changes are still easy to incorporate.
+
+Once an API is released, it will subject to change, as a result of new requirements. It is crucial that these changes do not break existing API consumers - or if this is not possible, that the breaking changes are known upfront and can be communicated to the API consumers. That's where consumer driven contract testing comes in. In consumer driven contract testing, every API consumer defines his expectations on the API, which is formalized in a consumer contract. The API provider collects all these contracts, and continuously tests the API implementation against the contracts, to ensure that new releases of the API do not break existing consumers.
+
+There are several tools and frameworks available to help with consumer driven contract testing. In this lab you will use Pact (https://pact.io) to create a consumer contract for the API you developed in the first part of the lab. On the API provider side, you use Pact to build an integration test that validates implementation against the contract.  
+
+== Development Environment
+
+In this lab you will design the REST API of the responder service of the Emergency Response application. As its name indicates, the responder service manages responder entities (or aggregates if you're into Domain Driven Design). One of the requirements for the responder service is to expose a REST API that allows CRUD (Create - Read - Update - Delete) operations.
+
+To design the API you use the _Apicurito API designer_. Apicurito is a slim standalone version of Apicurio Studio (https://www.apicur.io/studio/). Apicurito is basically the OpenAPI editor found in Studio and repackaged as a simple standalone web application. It only supports the core visual editing experience found in Studio, without the collaboration, persistence, and integration with external systems. In the context of this lab however, this is all you need. With Apicurito you can design OpenAPI documents and export them.
+
+. Make sure you are logged in the OpenShift cluster as a user with admin privileges.
+. Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file:
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+
+. Deploy the Apicurito API designer in the `user1-api-dev` namespace on OpenShift:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/apicurito.yml -e namespace_tools=user1-api-dev
+----
++
+The `apicurito` playbook installs the Apicurito operator, and a Custom Resource for Apicurito. 
+
+. Obtain the URL for the Apicurito API designer:
++
+----
+$ APICURITO_URL=$(oc get route apicurito-service -n user1-api-dev --template='{{ .spec.host }}')
+$ echo http://${APICURITO_URL}
+----
+
+. Open a browser window and enter the Apicurito URL in the address bar. Expect to see the Apicurito API designer home page.
++
+image::images/apicurito-home-page.png[]
+
+== API First Design and Test Driven Development 
+
+=== Design the API for the Responder Service
+
+As mentioned above the responder service manages responder entities. The responder service requires a REST API to create, retrieve, update and delete responder entities. In this section of the lab you design the API in Apicurito API designer, which results in an OpenAPI specification document of the API.
+
+. In a browser window, navigate to the Apicurio API designer home page.
+. Click on the arrow next to the `New API` button and select `New (OpenAPI 3)`. Expect to see the Apicurito API design page.
++
+image::images/apicurito-new-api.png[]
++
+image::images/apicurito-api-design-page.png[]
+
+. Start by giving a title to the API. Click on the pencil symbol next to `New API`, and enter `Responder Service`. Click on the check mark on the right to accept your changes.
+. Add a description for the API. 
+. Optionally add contact information and a license (Apache 2.0 is a good choice).
+. Add a default tag with value `Responder`. The tags object allows you to arrange the paths into named groups when visualizing the OpenAPI spec document.
+. At this point the Apicurito design page should look like:
++
+image::images/apicurito-design-general-info.png[]
+. At any time you can click on the `Source` tab to see the YAML source of the document.
++
+image::images/apicurito-design-source.png[]
++
+The source view is editable, so you can edit the document in the editor. If you prefer, you can also switch to a JSON representation of the document. Remember to click `Save` to add your changes to the document.
++
+NOTE: The Apicurito API designer does not have a persistence mechanism, so if you accidentally leave the design page, you will lose your work in progress. Therefore it is a good idea to regularly export your document to disk. This can be done by clicking on the `Save As` button on the top right of the page. +
+In case you lose the designer page, you can return to the home page and upload the exported document.
+
+. Add a data type for the responder entity. Click on the `Add a data type` link in the left pane of the page. Expect to see the `Define a New Data Type` page.
+* Enter `Responder` in the `Name` field. +
+* The Apicurito API designer can deduce the type definition from an example JSON structure. Enter an example JSON representation of the responder entity in the `Enter JSON Example` text box:   
++
+----
+{
+  "id": "25",
+  "name": "John Doe",
+  "phoneNumber": "(111) 222-3333",
+  "latitude": 39.17972,
+  "longitude": -75.99047,
+  "boatCapacity": 9,
+  "medicalKit": false,
+  "available": true
+}
+----
+* The Apicurito API designer can auto-generate paths and operations based on the data type. To use this functionality, select the `Rest Resource` button at the bottom of the page.
++
+image::images/apicurito-create-data-type.png[]
+* Click `Save`. Expect to return to the API design page.
++
+image::images/apicurito-api-design-page-2.png[]
+* Review the data type definition that was generated for the Responder data type. You can add a description to each field. If you click on the data type link for a given field, you can change its type, and mark a field as required. By default all fields are marked optional, which is all right for our use case. 
+
+. Review the paths created by the API designer. Notice that the designer created and documented all the CRUD operations for the responder entity. +
+There are however some additions to be made to complete the API design:
+* The `/responders GET` operation returns the list of all responders. As part of the API you want to support pagination. To achieve this you define two query parameters on the `/responders GET` operation: `limit` and `offset`. Limit defines the maximum number of responder entities to return, and offset determines the position of the first entity to return, where the position is equal to `limit * offset`. +
+In the API design page, navigate to the `GET` operation of the `/responders`, and expand the query parameters section. Click the `Add a query parameter` link.
++
+image::images/api-designer-add-query-parameter.png[]
+* On the `Define a New Query Parameter` page, enter `limit` as the name of the parameter. Mark the parameter as `Not required`, and set the type to `Integer`. Click `Save`.
++
+image::images/apicurio-designer-query-parameter-page.png[]
+* Repeat for the offset query parameter.
+
+. One of the requirements for the responder service is to be able to return all the responders which are available. This could be accomplished with a query parameter on the `/responders GET` operation, but an alternative is to have a separate path for this.
+* In the left pane of the designer, click On the image:images/plus.png[] symbol next to `Paths` to create an new path.
+* In the `Add path` dialog box, enter `responders/filter/available` as the path. Fill in the summary and description for the new path.
+* Click on the `Add operation` to add an operation.
++
+image::images/apicurio-designer-add-operation.png[]
+* Complete the `GET` operation definition. Add a response, and query parameters for pagination. 
++
+image::images/apicurio-designer-available-responders.png[]
+
+. The `/responder/{responderId} DELETE` operation allows to delete a single responder entity by its Id. The responder service also has a requirement for a REST endpoint to delete all the responders at once. To meet this requirement, add a `DELETE` operation to the `/responders` path. The `DELETE` operation has no query parameters and returns a 204 response code.
++
+image::images/apicurio-designer-delete-operation.png[]
+
+. The `/responders POST` operation allows to create a responder. The responder service has the requirement to be able to create a collection of responders with a single REST call. To achieve this, you can change the request body of the `/responders POST` operation to be an array of Responder entities rather tha a single Responder entity.
++
+image::images/apicurito-designer-responders-post-body.png[]
+
+. The `/responder/{responderId} GET` operation returns a response code 200 if the responder entity was found. Add a response code of 404 in the case the responder entity with the given Id does not exist.
+
+. Review the API specification. Once you're happy with it, export the document to your local file system as a YAML file.
+
+=== Create a Test Suite for the Responder Service API
+
+Before you start the implementation of the API it is a good idea to create a test suite for the API. A recommended practice in test-driven development, writing a test suite before starting the implementation allows to you to verify that the API you implement actually matches the specification as expressed in the OpenAPI document for the API.
+
+There are several tools available to help with defining and maintaining a test suite for your APIs. In this lab you are going to use Postman, a popular versatile API design, testing and mocking tool (https://www.postman.com).
+
+In this section of the lab, you import the OpenAPI specification created earlier into the standalone Postman application, and design a tests suite for the API. 
+
+. Install Postman on your local workstation if you don't have it installed yet. Navigate to `https://www.postman.com/downloads/` and download the version matching your OS. At the moment of writing the latest version is 7.27.1. Untar or unzip the downloaded archive, and add the `Postman` binary to your PATH. Verify that the installation was successful. The response of the `which` command should point to the Postman executable binary.
++
+----
+$ which Postman
+----
+
+. Open the Postman application. If this is the first time you used Postman, expect to be greeted with a sign-up page. Feel free to skip this stage and go directly to the application.
++
+image::images/postman-signup-page.png[]
++
+Expect to see the landing page of the Postman application:
++
+image::images/postman-empty-home-page.png[]
+
+. Import the responder service OpenAPI spec document in Postman.
+* Click on the `Import` button in the top bar of the Postman landing page.
++
+image::images/postman-import.png[]
+* In the Import pop-up window, click `Upload Files` and upload the responder service OpenAPI spec document you exported in the previous section of this lab. Click `Import` to confirm.
++
+image::images/postman-import-confirm.png[]
+* Click on the `Collections` tab and expect to see the different APIs that you specified in the OpenAPI spec document.
++
+image::images/postman-responder-service-api.png[]
+
+. The Postman collection generated from the OpenAPI document is sufficient to manually test the API of the responder service. Through the Postman UI you can individually test the different operation of the API. However one of the interesting features of Postman is that it allows to define complete test suites that can be automated and incorporated in the CI/CD pipeline of an application. +
+Rather than starting from scratch, you can duplicate the `Responder Service` into a new collection, and start from there. +
+Click on the image:images/three-points.png[] symbol next to the `Responder Service` collection, and select `Duplicate`. Click on the image:images/three-points.png[] symbol of the duplicated collection, select `Edit`, and change the name of the collection to `Responder Service Test Suite`. Click `Update`.
++
+image::images/postman-update-collection.png[]
+
+. Create a first test to verify that responders can be successfully created. Tests are supposed to be self-contained, and should make no assumptions about the current state of the application. So your first test will actually consist of three REST calls: a first call to delete all the responders, a second call to create a number of responders, and a third call to retrieve all the responders, so that you can verify that the responders were indeed created.
+* Click on the image:images/three-points.png[] symbol next to the `Responder Service Test Suite` collection, and select `Add Folder`. In the dialog box, enter `Create Responders`. Feel free to add a description for the test. Click `Create` to create the new folder.
+* Select the `Delete all Responders` operation in the `responders` folder. Right-click and select `Duplicate`. Drag the duplicate entry to the `Create Responders` folder. Change the name into `Delete all Responders`.
++
+image::images/postman-delete-all-responders.png[]
++
+Notice the URL of the request: `{{baseUrl}}/responders`. Postman has the notion of collection variables, which will be applied to all requests of a collection. When executing the tests, you will set the value of the `baseUrl` variable to the URL of the application.
+* Select the `Tests` tab. Here you can define assertions for your tests. Tests scripts are written in JavaScript. For the `/responders DELETE` operations, you expect the application to return a `204` response code. Enter the following in the test box:
++
+----
+pm.test("Status code is 204", function () {
+    pm.response.to.have.status(204);
+});
+----
++
+Postman has a rich DSL to express test assertions. Refer to https://learning.postman.com/docs/postman/scripts/test-scripts/ on writing test scripts and assertions for Postman.
++
+Save the Postman operation with `Ctrl+s` or by clicking on the `Save` button.
+* Duplicate the `Create a collection of Responder` entry into the `Responder Service Test Suite` collection. Open the `Body` tab and notice that Postman auto-generated a request payload for the POST call. Edit the generated request body to delete the `id` elements from the request. You can keep the generated values for the other fields, or modify them to more sensible values.
++
+image:images/postman-create-responders-body.png[]    
+* Open the `Test` tab. The POST response should return a `201` response code. Enter the following Javascript assertion in the text box and save:
++
+----
+pm.test("Status code is 201", function () {
+    pm.response.to.have.status(201);
+});
+----
+* Duplicate the `List all responders` entry into the `Responder Service Test Suite` collection. In the `Params` tab, deselect the `limit` and `offset` query parameters.
++
+image::images/postman-list-responders-deselect-query-parameters.png[] 
+* For the `List all responders` REST call you can test several things: the HTTP return code, which should be 200; the presence of a `Content-type` header in the response with value `application/json`; the response itself, which should be an array of 2 responder entities. You can even define the schema for a responder entity and verify that the response matches the schema. +
+Enter the following javascript in the text box and save the entry:
++
+----
+var jsonData = pm.response.json();
+
+var schema = {
+    "type": "array",
+    "items": {
+        "type": "object",
+	    "properties": {
+			"id": {"type": "string"},
+			"name": {"type": "string"},
+			"phoneNumber": {"type": "string"},
+			"latitude": { "type": "number"},
+            "longitude": { "type": "number"},
+			"boatCapacity": {"type": "integer"},
+			"medicalKit": {"type": "boolean"},
+			"available": {"type": "boolean"}
+        }
+    }
+}
+
+pm.test("Status code is 200", function () {
+    pm.response.to.have.status(200);
+});
+pm.test("Content-Type is present", function () {
+    pm.response.to.have.header("Content-Type");
+    pm.response.to.be.header("Content-Type", "application/json");
+});
+pm.test("Number of records returned is 2", function() {
+	num = Object.keys(jsonData).length;
+	pm.expect(num).to.eql(2);
+});
+pm.test("Schema is valid", function() {
+	pm.expect(tv4.validate(jsonData, schema)).to.be.true;							
+});
+----
+
+You have a defined a first test for the responder service REST API. In the true spirit of test driven development, you should create more tests in order to validate the complete API. In this lab, you take a shortcut, and move straight away to the implementation phase.
+
+=== Implement the Responder Service API
+
+The course code repository contains an application skeleton for the responder service, implemented with Quarkus.
+
+. Check out the code for the responder service application skeleton
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/responder-service-api-first.git
+----
+
+. Import the project in your IDE of choice 
+. Review the code. Notice the following classes and files:
+* `ResponderEntity`: the JPA Entity class for the responder.
+* `Responder`: represents the responder.
+* `ResponderRepository`: extends `PanacheRepository`. Panache is a sub-project of Quarkus aiming to simplify the development of CRUD applications. The PanacheRepository provides a number of convenience methods which greatly reduce boilerplate code when using JPA. +
+See https://quarkus.io/guides/hibernate-orm-panache for more information. +
+The implementation contains mapper methods between `Responder` and `ResponderEntity`.
+* `ResponderResource`: empty for now, this is where you will implement the REST API.
+* `application.properties`: the configuration for the application. The application uses the in-memory H2 database, for the sake of simplicity.
+
+. Start the application in _Quarkus dev_ mode:
++
+----
+$ mvn clean compile quarkus:dev
+----
++
+.Sample output
+----
+[...]
+[INFO] --- quarkus-maven-plugin:1.5.2.Final:dev (default-cli) @ responder-service-api-first ---
+Listening for transport dt_socket at address: 5005
+Hibernate: 
+    
+    drop table if exists Responder CASCADE 
+Hibernate: 
+    
+    drop sequence if exists responder_sequence
+Hibernate: create sequence responder_sequence start with 1 increment by 10
+Hibernate: 
+    
+    create table Responder (
+       responder_id bigint not null,
+        available boolean,
+        boat_capacity integer,
+        responder_current_gps_lat decimal(7,5),
+        responder_current_gps_long decimal(7,5),
+        has_medical_kit boolean,
+        responder_name varchar(255),
+        responder_phone_number varchar(255),
+        version bigint,
+        primary key (responder_id)
+    )
+__  ____  __  _____   ___  __ ____  ______ 
+ --/ __ \/ / / / _ | / _ \/ //_/ / / / __/ 
+ -/ /_/ / /_/ / __ |/ , _/ ,< / /_/ /\ \   
+--\___\_\____/_/ |_/_/|_/_/|_|\____/___/   
+2020-07-06 10:14:49,589 INFO  [io.quarkus] (Quarkus Main Thread) responder-service-api-first 1.0.0-SNAPSHOT on JVM (powered by Quarkus 1.5.2.Final) started in 1.468s. Listening on: http://0.0.0.0:8080
+2020-07-06 10:14:49,591 INFO  [io.quarkus] (Quarkus Main Thread) Profile dev activated. Live Coding activated.
+2020-07-06 10:14:49,592 INFO  [io.quarkus] (Quarkus Main Thread) Installed features: [agroal, cdi, hibernate-orm, hibernate-orm-panache, jdbc-h2, mutiny, narayana-jta, resteasy-jackson]
+----
+
+. Run the Postman tests you created previously. 
+* In the Postman application, click on the image:images/postman_manage_environments.png[] symbol on the top right to create a new environment for the tests.
+* In the dialog window, click `Add` to add a new environment.
+* Call the environment `localhost`, and add a variable with name `baseUrl` and value `http://localhost:8080`.
++
+image::images/postman-create-environment.png[]
++
+Click `Add` to create the environment.
+* Back in the main Postman application window, click the `Runner` button in the top menu bar to launch the Postman collection runner.
+* In the collection selection box, select the `Create Responders` collection. Select the `localhost` environment. Check the `Run collection without using stored cookies` checkbox.
++
+image::images/postman-collection-runner-selection.png[]
+* Click the blue `Run Responder` button to launch the run the collection.
+* Expect all tests to fail, as you haven't implemented the REST API yet.
++
+image::images/postman-collection-run-failed.png[]
+
+. Implement the REST API for the responder service. To pass the first test, you only need to implement the `/responders DELETE`, `/responders POST` and `/responders GET` REST calls. You can ignore pagination for the `/responders GET` for now. +
+Quarkus dev mode supports hot reload, so you don't have to restart the application for your new code to be available. This means you can rapidly cycle between implementing the REST API and testing with Postman.
+
+. If the API is implemented correctly, the tests suite should pass:
++
+image::images/postman-collection-run-success.png[]
++
+NOTE: if you're stuck with the implementation, you can have a look at the `create-responder` branch of the project. The `ResponderResource` in that branch contains the implementation for the three REST operations.
+
+. At this point you can create new tests in Postman for the other REST operations defined in the OpenAPI spec document, and implement the full responder service REST API. +
+The `implementation-complete` branch of the source code has a complete implementation of the API, as well as a full Postman test suite in the `postman` folder. You can import this collection into Postman, and run your implementation against it. You should obtain the following results:
++
+image::images/postman-collection-full-test-suite.png[]
+
+The next step is automating Postman collection runs and incorporate them into a CI/CD pipeline. This is beyond the scope of this course at the moment.
+
+== Create and run Pact Contract Tests
+
+Pact-JVM is a Java Virtual Machine based implementation of the Pact contract testing framework. It allows for contract consumers to create the contracts, and for the providers to verify the contracts against the implementation. When using Pact-JVM, contract generation and verification can be built as JUnit unit tests, or integrated into a maven build with the Pact-JVM maven plugin.
+
+A typical workflow for Pact contract tests looks like the following:
+
+* On the consumer side, interactions against a mock version of the API are recorded. The interactions describe a typical request to the API provider, as well as a minimal response expected by the consumer. The artifact is a JSON document describing the interactions with the API, called a pact. It codifies what the consumer expects from the provider.
+* The pact is shared with the provider. There are different ways to do so. The Pact ecosystem contains a Pact broker, which acts a a repository for pacts. Providers can retrieve the pacts from this broker when they want to verify the contracts, and publish back the verification results. +
+A simpler way is to add to pact files to the code base of the API provider.
+* The provider verifies the contracts against the implementation, verifying that the implementation does honor the contracts. This requires a running version of the provider. Typically contract verification tests will run as part of the integration test suite for the application, and built in into the CI/CD pipeline of the application.
+
+In this section of the lab you add contract testing to the responder service of the Emergency Response demo application. One of the consumers of the responder service API is the process service, which calls the responder service to get a list of available responders. So you first generate the contract on the process service. You add the contract to the codebase of the responder service, and write integration tests to actually verify the contract.
+
+=== Generate the contract on the API Consumer
+
+. Check out the code of the process service of the Emergency Response application. The process service is a Spring Boot application which embeds the RHPAM process engine. It manages the state and lifecycle of incidents in the Emergency response application: incidents are matched with an available responder, and the state of the incident is updated through the lifecycle of the incident, until the incident is closed.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/process-service.git
+----
+
+. Import the code in your IDE of choice.
+
+. In this lab you implement the Pact consumer contract generation as a JUnit test. Add the following dependencies to the the `pom.xml` file of the process service project:
++
+----
+    <dependency>
+      <groupId>au.com.dius.pact.consumer</groupId>
+      <artifactId>junit</artifactId>
+      <version>4.1.5</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>au.com.dius.pact.consumer</groupId>
+      <artifactId>java8</artifactId>
+      <version>4.1.5</version>
+      <scope>test</scope>
+    </dependency>
+----
+
+. Create a new package `com.redhat.cajun.navy.process.pact` in the `src/test/java` folder.
+. Create a class `ResponderServicePactContracts` in the `com.redhat.cajun.navy.process.pact` package.
+. The Pact-JVM integration with JUnit 4 provides a JUnit Rule that will set up the Pact mock server against which to run the interactions with the provider API. +
+Add the following to the `ResponderServicePactContracts` class:
++
+----
+    @Rule
+    public PactProviderRule provider = new PactProviderRule("responder-service", "localhost", 0, this);
+----
+
+. The Pact test requires at least one method annotated with `au.com.dius.pact.core.model.annotations.Pact` which describes the expectations of the consumer against the provider API. The process service only calls one method on the responder service, so we only need one method annotated with `@Pact`. +
+Add the following method to the class:
++
+----
+    @Pact(provider = "responder-service", consumer = "process-service")
+    public RequestResponsePact availableResponders(PactDslWithProvider builder) {
+        return builder.given("Available responders")
+                .uponReceiving("A request for available responders")
+                .method("GET")
+                .path("/responders/available")
+                .query("limit=100")
+                .willRespondWith()
+                .status(200)
+                .headers(Collections.singletonMap("Content-Type", "application/json"))
+                .body(io.pactfoundation.consumer.dsl.LambdaDsl.newJsonArrayMaxLike(100, (a) -> a.object((o) -> {
+                    o.stringType("id", "1");
+                    o.numberType("latitude", new BigDecimal("30.12345").doubleValue());
+                    o.numberType("longitude", new BigDecimal("-70.98765").doubleValue());
+                    o.numberType("boatCapacity", 10);
+                    o.booleanType("medicalKit");
+                    o.booleanType("person");
+                })).build())
+                .toPact();
+    }
+----
++
+This code fragment describes what the process is expecting from the responder service: when the process service calls the `/responders/available GET` REST endpoint on the responder service with query parameter `limit=100`, the process service expects a JSON array of maximum 100 responder entities, where each entity should have at least the following fields: `id` of type string, `latitude` and `longitude` of type double, `boatCapacity` of type integer, `medicalKit` and `person` of type boolean. The HTTP response code should be 200. +
+Also notice that the `provider` attribute of the `@Pact` annotation matches the provider name in the JUnit rule.
+
+. Finally you need a proper JUnit test method that will actually exercise the described interaction against the Pact mock server and produce a Pact contract file. +
+Add the following method to the class:
++
+----
+	@Test
+	@PactVerification(value = "responder-service", fragment = "availableResponders")
+	public void testAvailableResponders() throws IOException {
+
+		HttpResponse httpResponse = Request.Get(provider.getUrl() + "/responders/available?limit=100")
+			    .execute().returnResponse();
+		MatcherAssert.assertThat(httpResponse.getStatusLine().getStatusCode(), CoreMatchers.equalTo(200));
+	}
+----
++
+Notice that the `value` attribute of the `@PactVerification` annotation matches the name of the provider in the `@Pact` annotation, and the `fragment` attribute matches the method name of method annotated with `@Pact`.
+
+. Typically consumer Pact tests will run as part of the integration test suite. In this lab you add the run the Pact tests as part of a separate maven profile. Add the following to the project pom.xml file:
++
+----
+  <profiles>
+    <profile>
+      <id>consumer-pacts</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <skipTests>true</skipTests>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>default</id>
+                <goals>
+                  <goal>integration-test</goal>
+                  <goal>verify</goal>
+                </goals>
+                <configuration>
+                  <includes>
+                    <include>**/*PactContracts.java</include>
+                  </includes>
+                  <excludes>
+                    <exclude>**/*IT.java</exclude>
+                  </excludes>
+                  <useManifestOnlyJar>false</useManifestOnlyJar>
+                  <useSystemClassLoader>true</useSystemClassLoader>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+----
++
+This XML fragment tells maven to run the Pact contract verification test classes as part of the integration test execution, but only when the `consumer-pacts` profile is active.
+
+. Run the test to generate the Pact contract of the process service for the responder service provider:
++
+----
+$ mvn clean verify -Pconsumer-pacts
+----
++
+.Sample output
+----
+[...]
+INFO] --- maven-failsafe-plugin:2.22.0:integration-test (default) @ process-service ---
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running com.redhat.cajun.navy.process.pact.ResponderServicePactContracts
+20:42:48.378 [main] DEBUG au.com.dius.pact.consumer.BaseJdkMockServer - Starting mock server
+20:42:48.381 [main] DEBUG au.com.dius.pact.consumer.BaseJdkMockServer - Mock server started: /127.0.0.1:42873
+20:42:48.610 [main] DEBUG org.apache.http.client.protocol.RequestAddCookies - CookieSpec selected: default
+20:42:48.622 [main] DEBUG org.apache.http.client.protocol.RequestAuthCache - Auth cache not set in the context
+20:42:48.623 [main] DEBUG org.apache.http.impl.conn.BasicHttpClientConnectionManager - Get connection for route {}->http://localhost:42873
+20:42:48.633 [main] DEBUG org.apache.http.impl.conn.DefaultManagedHttpClientConnection - http-outgoing-0: set socket timeout to 0
+20:42:48.634 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Opening connection {}->http://localhost:42873
+20:42:48.635 [main] DEBUG org.apache.http.impl.conn.DefaultHttpClientConnectionOperator - Connecting to localhost/127.0.0.1:42873
+20:42:48.638 [main] DEBUG org.apache.http.impl.conn.DefaultHttpClientConnectionOperator - Connection established 127.0.0.1:58670<->127.0.0.1:42873
+20:42:48.638 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Executing request OPTIONS / HTTP/1.1
+20:42:48.638 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Target auth state: UNCHALLENGED
+20:42:48.639 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Proxy auth state: UNCHALLENGED
+20:42:48.641 [main] DEBUG org.apache.http.headers - http-outgoing-0 >> OPTIONS / HTTP/1.1
+20:42:48.641 [main] DEBUG org.apache.http.headers - http-outgoing-0 >> X-PACT-BOOTCHECK: true
+20:42:48.641 [main] DEBUG org.apache.http.headers - http-outgoing-0 >> Host: localhost:42873
+20:42:48.641 [main] DEBUG org.apache.http.headers - http-outgoing-0 >> Connection: Keep-Alive
+20:42:48.641 [main] DEBUG org.apache.http.headers - http-outgoing-0 >> User-Agent: Apache-HttpClient/4.5.12 (Java/11.0.7)
+20:42:48.641 [main] DEBUG org.apache.http.headers - http-outgoing-0 >> Accept-Encoding: gzip,deflate
+20:42:48.642 [main] DEBUG org.apache.http.wire - http-outgoing-0 >> "OPTIONS / HTTP/1.1[\r][\n]"
+20:42:48.642 [main] DEBUG org.apache.http.wire - http-outgoing-0 >> "X-PACT-BOOTCHECK: true[\r][\n]"
+20:42:48.642 [main] DEBUG org.apache.http.wire - http-outgoing-0 >> "Host: localhost:42873[\r][\n]"
+20:42:48.642 [main] DEBUG org.apache.http.wire - http-outgoing-0 >> "Connection: Keep-Alive[\r][\n]"
+20:42:48.642 [main] DEBUG org.apache.http.wire - http-outgoing-0 >> "User-Agent: Apache-HttpClient/4.5.12 (Java/11.0.7)[\r][\n]"
+20:42:48.642 [main] DEBUG org.apache.http.wire - http-outgoing-0 >> "Accept-Encoding: gzip,deflate[\r][\n]"
+20:42:48.642 [main] DEBUG org.apache.http.wire - http-outgoing-0 >> "[\r][\n]"
+20:42:48.664 [main] DEBUG org.apache.http.wire - http-outgoing-0 << "HTTP/1.1 200 OK[\r][\n]"
+20:42:48.665 [main] DEBUG org.apache.http.wire - http-outgoing-0 << "Date: Mon, 06 Jul 2020 18:42:48 GMT[\r][\n]"
+20:42:48.665 [main] DEBUG org.apache.http.wire - http-outgoing-0 << "Transfer-encoding: chunked[\r][\n]"
+20:42:48.665 [main] DEBUG org.apache.http.wire - http-outgoing-0 << "X-pact-bootcheck: true[\r][\n]"
+20:42:48.665 [main] DEBUG org.apache.http.wire - http-outgoing-0 << "[\r][\n]"
+20:42:48.667 [main] DEBUG org.apache.http.headers - http-outgoing-0 << HTTP/1.1 200 OK
+20:42:48.667 [main] DEBUG org.apache.http.headers - http-outgoing-0 << Date: Mon, 06 Jul 2020 18:42:48 GMT
+20:42:48.667 [main] DEBUG org.apache.http.headers - http-outgoing-0 << Transfer-encoding: chunked
+20:42:48.667 [main] DEBUG org.apache.http.headers - http-outgoing-0 << X-pact-bootcheck: true
+20:42:48.671 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Connection can be kept alive indefinitely
+20:42:48.675 [main] DEBUG org.apache.http.impl.conn.DefaultManagedHttpClientConnection - http-outgoing-0: Close connection
+20:42:48.677 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Connection discarded
+20:42:48.677 [main] DEBUG org.apache.http.impl.conn.BasicHttpClientConnectionManager - Releasing connection [Not bound]
+20:42:48.700 [main] DEBUG org.apache.http.client.protocol.RequestAddCookies - CookieSpec selected: default
+20:42:48.701 [main] DEBUG org.apache.http.client.protocol.RequestAuthCache - Auth cache not set in the context
+20:42:48.701 [main] DEBUG org.apache.http.impl.conn.PoolingHttpClientConnectionManager - Connection request: [route: {}->http://localhost:42873][total available: 0; route allocated: 0 of 100; total allocated: 0 of 200]
+20:42:48.703 [main] DEBUG org.apache.http.impl.conn.PoolingHttpClientConnectionManager - Connection leased: [id: 0][route: {}->http://localhost:42873][total available: 0; route allocated: 1 of 100; total allocated: 1 of 200]
+20:42:48.704 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Opening connection {}->http://localhost:42873
+20:42:48.705 [main] DEBUG org.apache.http.impl.conn.DefaultHttpClientConnectionOperator - Connecting to localhost/127.0.0.1:42873
+20:42:48.706 [main] DEBUG org.apache.http.impl.conn.DefaultHttpClientConnectionOperator - Connection established 127.0.0.1:58672<->127.0.0.1:42873
+20:42:48.706 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Executing request GET /responders/available?limit=100 HTTP/1.1
+20:42:48.706 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Target auth state: UNCHALLENGED
+20:42:48.706 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Proxy auth state: UNCHALLENGED
+20:42:48.706 [main] DEBUG org.apache.http.headers - http-outgoing-1 >> GET /responders/available?limit=100 HTTP/1.1
+20:42:48.707 [main] DEBUG org.apache.http.headers - http-outgoing-1 >> Host: localhost:42873
+20:42:48.707 [main] DEBUG org.apache.http.headers - http-outgoing-1 >> Connection: Keep-Alive
+20:42:48.707 [main] DEBUG org.apache.http.headers - http-outgoing-1 >> User-Agent: Apache-HttpClient/4.5.12 (Java/11.0.7)
+20:42:48.707 [main] DEBUG org.apache.http.headers - http-outgoing-1 >> Accept-Encoding: gzip,deflate
+20:42:48.708 [main] DEBUG org.apache.http.wire - http-outgoing-1 >> "GET /responders/available?limit=100 HTTP/1.1[\r][\n]"
+20:42:48.708 [main] DEBUG org.apache.http.wire - http-outgoing-1 >> "Host: localhost:42873[\r][\n]"
+20:42:48.708 [main] DEBUG org.apache.http.wire - http-outgoing-1 >> "Connection: Keep-Alive[\r][\n]"
+20:42:48.708 [main] DEBUG org.apache.http.wire - http-outgoing-1 >> "User-Agent: Apache-HttpClient/4.5.12 (Java/11.0.7)[\r][\n]"
+20:42:48.708 [main] DEBUG org.apache.http.wire - http-outgoing-1 >> "Accept-Encoding: gzip,deflate[\r][\n]"
+20:42:48.708 [main] DEBUG org.apache.http.wire - http-outgoing-1 >> "[\r][\n]"
+20:42:48.719 [HTTP-Dispatcher] DEBUG au.com.dius.pact.consumer.BaseJdkMockServer - Received request:    method: GET
+        path: /responders/available
+        query: {limit=[100]}
+        headers: {Accept-encoding=[gzip,deflate], Connection=[Keep-Alive], Host=[localhost:42873], User-agent=[Apache-HttpClient/4.5.12 (Java/11.0.7)]}
+        matchers: MatchingRules(rules={})
+        generators: Generators(categories={})
+        body: EMPTY
+20:42:48.721 [HTTP-Dispatcher] DEBUG au.com.dius.pact.core.matchers.RequestMatching - comparing to expected request: 
+        method: GET
+        path: /responders/available
+        query: {limit=[100]}
+        headers: {}
+        matchers: MatchingRules(rules={})
+        generators: Generators(categories={})
+        body: MISSING
+20:42:48.730 [HTTP-Dispatcher] DEBUG au.com.dius.pact.core.matchers.QueryMatcher - compareQueryParameterValues: No matcher defined for query parameter 'limit', using equality
+20:42:48.733 [HTTP-Dispatcher] DEBUG au.com.dius.pact.core.matchers.Matching - No matcher for null, using equality
+20:42:48.734 [HTTP-Dispatcher] DEBUG au.com.dius.pact.core.matchers.RequestMatching - Request mismatch: []
+20:42:48.771 [HTTP-Dispatcher] DEBUG au.com.dius.pact.consumer.BaseJdkMockServer - Generating response:         status: 200
+        headers: {Content-Type=[application/json]}
+        matchers: MatchingRules(rules={body=Category(name=body, matchingRules={$=MatchingRuleGroup(rules=[MaxTypeMatcher(max=100)], ruleLogic=AND), $[*].id=MatchingRuleGroup(rules=[au.com.dius.pact.core.model.matchingrules.TypeMatcher@d1f6468], ruleLogic=AND), $[*].latitude=MatchingRuleGroup(rules=[NumberTypeMatcher(numberType=NUMBER)], ruleLogic=AND), $[*].longitude=MatchingRuleGroup(rules=[NumberTypeMatcher(numberType=NUMBER)], ruleLogic=AND), $[*].boatCapacity=MatchingRuleGroup(rules=[NumberTypeMatcher(numberType=NUMBER)], ruleLogic=AND), $[*].medicalKit=MatchingRuleGroup(rules=[au.com.dius.pact.core.model.matchingrules.TypeMatcher@d1f6468], ruleLogic=AND), $[*].person=MatchingRuleGroup(rules=[au.com.dius.pact.core.model.matchingrules.TypeMatcher@d1f6468], ruleLogic=AND)})})
+        generators: Generators(categories={})
+        body: PRESENT([{"medicalKit":true,"person":true,"latitude":30.12345,"boatCapacity":10,"id":"1","longitude":-70.98765}])
+20:42:48.772 [main] DEBUG org.apache.http.wire - http-outgoing-1 << "HTTP/1.1 200 OK[\r][\n]"
+20:42:48.772 [main] DEBUG org.apache.http.wire - http-outgoing-1 << "Date: Mon, 06 Jul 2020 18:42:48 GMT[\r][\n]"
+20:42:48.772 [main] DEBUG org.apache.http.wire - http-outgoing-1 << "Content-length: 104[\r][\n]"
+20:42:48.772 [main] DEBUG org.apache.http.wire - http-outgoing-1 << "Content-Type: application/json[\r][\n]"
+20:42:48.772 [main] DEBUG org.apache.http.wire - http-outgoing-1 << "[\r][\n]"
+20:42:48.772 [main] DEBUG org.apache.http.headers - http-outgoing-1 << HTTP/1.1 200 OK
+20:42:48.772 [main] DEBUG org.apache.http.headers - http-outgoing-1 << Date: Mon, 06 Jul 2020 18:42:48 GMT
+20:42:48.772 [main] DEBUG org.apache.http.headers - http-outgoing-1 << Content-length: 104
+20:42:48.772 [main] DEBUG org.apache.http.headers - http-outgoing-1 << Content-Type: application/json
+20:42:48.773 [main] DEBUG org.apache.http.impl.execchain.MainClientExec - Connection can be kept alive indefinitely
+20:42:48.782 [main] DEBUG org.apache.http.wire - http-outgoing-1 << "[{"medicalKit":true,"person":true,"latitude":30.12345,"boatCapacity":10,"id":"1","longitude":-70.98765}]"
+20:42:48.782 [main] DEBUG org.apache.http.impl.conn.PoolingHttpClientConnectionManager - Connection [id: 0][route: {}->http://localhost:42873] can be kept alive indefinitely
+20:42:48.782 [main] DEBUG org.apache.http.impl.conn.DefaultManagedHttpClientConnection - http-outgoing-1: set socket timeout to 0
+20:42:48.782 [main] DEBUG org.apache.http.impl.conn.PoolingHttpClientConnectionManager - Connection released: [id: 0][route: {}->http://localhost:42873][total available: 1; route allocated: 1 of 100; total allocated: 1 of 200]
+20:42:48.887 [main] DEBUG au.com.dius.pact.consumer.BaseJdkMockServer - Mock server shutdown
+20:42:48.899 [main] DEBUG au.com.dius.pact.consumer.BaseMockServer - Writing pact process-service -> responder-service to file target/pacts/process-service-responder-service.json
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.534 s - in com.redhat.cajun.navy.process.pact.ResponderServicePactContracts
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] --- maven-failsafe-plugin:2.22.0:verify (integration-test) @ process-service ---
+[INFO] 
+[INFO] --- maven-failsafe-plugin:2.22.0:verify (default) @ process-service ---
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  11.322 s
+[INFO] Finished at: 2020-07-06T20:42:49+02:00
+[INFO] ------------------------------------------------------------------------
+----
+
+. The Pact contract file is written to the `target/pacts/process-service-responder-service.json` file. 
+
+=== Verify the Pact Contract on the API Provider
+
+Now that you have a contract describing the expectations of the process service to the responder service API, you can add Pact contract verification tests to the responder service. These tests will verify that the responder service REST API does honour the contract with the process service or other consumers of its API.
+
+. Check out the code of the responder service of the Emergency Response application.
++
+----
+$ git clone https://github.com/gpte-cloud-native-advanced/responder-service.git
+$ cd responder-service
+----
+
+. Copy the Pact contract file generated by the process service to the `src/test/resources/pact` folder in the responder service project.
++
+----
+$ mkdir src/test/resources/pact
+$ cp ../process-service/target/pacts/process-service-responder-service.json src/test/resources/pact
+----
+
+. Add the following dependencies to the `pom.xml` file of the responder service project:
++
+----
+    <dependency>
+      <groupId>au.com.dius.pact.provider</groupId>
+      <artifactId>junit5</artifactId>
+      <version>4.1.4</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+      <version>2.8.6</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.woodstox</groupId>
+      <artifactId>woodstox-core</artifactId>
+      <version>5.0.3</version>
+      <scope>test</scope>
+    </dependency>
+----
+
+. Create a package `com.redhat.erdemo.responder.pact.provider` in the `src/test/java` folder of the project.
+
+. Create a class `ProcessServicePactVerifications` in the `com.redhat.erdemo.responder.pact.provider` package.
+
+. The JUnit 5 integration of Pact-JVM is annotation-driven. Add the following annotations to the class:
++
+----
+package com.redhat.erdemo.responder.pact.provider;
+
+
+import au.com.dius.pact.provider.junitsupport.Provider;
+import au.com.dius.pact.provider.junitsupport.loader.PactFolder;
+
+@Provider("responder-service")
+@PactFolder("pact")
+public class ProcessServicePactVerifications {
+}
+----
++
+The `@Provider` annotation specifies the name of the provider as declared in the Pact contract. The `@PactFolder` annotation points to the folder containing the contract file.
+
+. Add a method annotated with `@TestTemplate` and `@ExtendWith(PactVerificationInvocationContextProvider.class)` that takes a `PactVerificationContext` parameter. You will need to call verifyInteraction() on the context parameter in your test template method.
++
+----
+    @TestTemplate
+    @ExtendWith(PactVerificationInvocationContextProvider.class)
+    void pactVerificationTestTemplate(PactVerificationContext context) {
+        context.verifyInteraction();
+    }
+----
+
+. The Pact provider tests run against a running instance of the responder service. So as part of the test you have to give the URL to the responder service. Obviously this URL is not known upfront, so you use environment variables to set the URL when the tests are executed. Add the following to the class:
++
+----
+    @BeforeEach
+    void before(PactVerificationContext context) throws MalformedURLException {
+        context.setTarget(HttpTestTarget.fromUrl(providerUrl()));
+    }
+
+    private URL providerUrl() throws MalformedURLException {
+        String provider = System.getenv("PACT_VERIFICATION_TARGET");
+        if (provider == null) {
+            throw new MalformedURLException("Provider URL is null");
+        }
+        return new URL(provider);
+    }
+----
+
+. Every interaction described in the contract file has a `State` description. In the case of the `process-service-responder-service.json` contract file, the state is defined as follows:
++
+----
+      "providerStates": [
+        {
+          "name": "Available responders"
+        }
+      ]
+----
++
+This corresponds to the `builder.given("Available responders")` statement from the Pact test in the process service. +
+For every state defined in the contract, you need a method annotated with `@State`. In this method you typically make sure that the application has the correct state for the test to succeed. +
+In the case of the responder service, you need to make sure that the database contains records for available responder entities, so that the call to `/responders/available` actually returns responder entities. +
+Add the following code to the test class. This code initializes the database with three responder entities.
++
+----
+    @State("Available responders")
+    void stateAvailableResponders() {
+        String url = url();
+        String user = user();
+        String password = password();
+
+        if (url == null || user == null || password == null) {
+            throw new IllegalStateException("Database URL, user or password cannot be null.");
+        }
+
+        String clear = "DELETE FROM public.responder";
+        String responder1 = "INSERT INTO public.responder( " +
+                "responder_id, responder_name, responder_phone_number, responder_current_gps_lat, responder_current_gps_long, boat_capacity, has_medical_kit, available, person, enrolled, version) " +
+                "VALUES (nextval('responder_sequence'), 'John Doe', '(456) 123-9874', 30.12345, -70.98765, 5, true, true, true, true, 0)";
+        String responder2 = "INSERT INTO public.responder( " +
+                "responder_id, responder_name, responder_phone_number, responder_current_gps_lat, responder_current_gps_long, boat_capacity, has_medical_kit, available, person, enrolled, version) " +
+                "VALUES (nextval('responder_sequence'), 'Jane Foo', '(654) 741-9632', 30.23456, -70.87654, 10, true, true, true, true, 0)";
+        String responder3 = "INSERT INTO public.responder( " +
+                "responder_id, responder_name, responder_phone_number, responder_current_gps_lat, responder_current_gps_long, boat_capacity, has_medical_kit, available, person, enrolled, version) " +
+                "VALUES (nextval('responder_sequence'), 'Pete Who', '(123) 159-9654', 30.34567, -70.76543, 5, true, false, true, true, 0)";
+
+        try (Connection connection = connection(url, user, password);
+             Statement statement = connection.createStatement()) {
+
+            statement.addBatch(clear);
+            statement.addBatch(responder1);
+            statement.addBatch(responder2);
+            statement.addBatch(responder3);
+            statement.executeBatch();
+            connection.commit();
+        } catch (SQLException | ClassNotFoundException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private Connection connection(String url, String user, String password) throws SQLException, ClassNotFoundException {
+        Class.forName("org.postgresql.Driver");
+        Connection connection = DriverManager.getConnection(url, user, password);
+        connection.setAutoCommit(false);
+        return connection;
+    }
+
+    private String url() {
+        return System.getenv("PACT_STAGE_DATABASE_URL");
+    }
+
+    private String user() {
+        return System.getenv("PACT_STAGE_DATABASE_USER");
+    }
+
+    private String password() {
+        return System.getenv("PACT_STAGE_DATABASE_PASSWD");
+    }
+----
++
+The database connection properties will be provided through environment variables when the test is run.
+
+. Pact verification tests are typically run as integration tests. Add the following to the `profiles` section of the `pom.xml` file in the responder service project to run the tests as part of the maven `verify` build phase when the `provider-pacts` profile is active.
++
+----
+    <profile>
+      <id>provider-pacts</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <version>${surefire-plugin.version}</version>
+            <configuration>
+              <skipTests>true</skipTests>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <version>${surefire-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>default</id>
+                <goals>
+                  <goal>integration-test</goal>
+                  <goal>verify</goal>
+                </goals>
+                <configuration>
+                  <includes>
+                    <include>**/*PactVerifications.java</include>
+                  </includes>
+                  <excludes>
+                    <exclude>**/*IT.java</exclude>
+                  </excludes>
+                  <useManifestOnlyJar>false</useManifestOnlyJar>
+                  <useSystemClassLoader>true</useSystemClassLoader>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+----
+
+=== Test the API Provider
+
+To run the Pact provider verification test, you need a running instance of the responder service. The responder service requires an AMQ Streams cluster and a PostgreSQL database to function. In this section of the lab, you deploy a test environment on OpenShift for the responder service.
+
+. Make sure you are logged in the OpenShift cluster as a user with admin privileges.
+. Check out the Ansible installer for the Emergency Response demo. Change directory to the `ansible` directory.
++
+----
+$ git clone https://gitub.com/gpte-cloud-native-advanced/erdemo-install.git
+$ cd erdemo-install/ansible
+----
+. Copy the inventory template file:
++
+----
+$ cp inventories/inventory.template inventories/inventory
+----
+
+. Deploy the AMQ Streams operator:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=pact
+----
++
+This command deploys the AMQ Streams operator in the `user1-pact` namespace. The scope of the operator is the namespace itself.
+
+. Deploy the AMQ Streams cluster:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=pact -e zookeeper_storage_type=ephemeral -e kafka_storage_type=ephemeral
+----
++
+This command deploys a Kafka cluster consisting of 3 ZooKeeper nodes and 3 Kafka broker nodes in the `user1-pact` namespace. Both Zookeeper and the Kafka brokers use ephemeral storage - which is perfectly acceptable in a short-lived development environment. 
+
+. Deploy the Kafka topics:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=pact
+----
++
+This command deploys the Kafka topics used by the Emergency Response application. Every topic is created with 15 partitions and a replication factor of 3.
+
+. Deploy the PostgreSQL database. 
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/postgresql.yml -e project_admin=user1 -e project_name=pact -e postgresql_storage_type=ephemeral
+----
++
+This command deploys a PostgreSQL version 12 database with ephemeral storage. +
+As part of the deployment of the PostgreSQL instance, the Emergency Response database and tables are created using deployment pod-based lifecycle hooks.
+
+. Deploy the responder service:
++
+----
+$ ansible-playbook -i inventories/inventory playbooks/responder_service.yml -e project_admin=user1 -e project_name=pact -e expose_service=true
+----
++
+This command deploys the responder service image and configures the application configuration configmap. The responder service is exposed through a route.
+
+. The Pact verification test needs access to the PostgreSQL database. However, the database is not accessible from outside of the OpenShift cluster. To be able to connect to the database from your local workstation you need to port-forward the port of the PostgreSQL pod to your local workstation. +
+Open a new terminal window, and execute the following commands:
++
+----
+$ oc project user1-pact
+$ oc get pods | grep postgresql
+$ oc port-forward <name of the PostgreSQL pod> 5432:5432
+----
++
+.Sample output
+----
+Forwarding from 127.0.0.1:5432 -> 5432
+Forwarding from [::1]:5432 -> 5432
+----
+
+. Go back to the other terminal, and set the following environment variables for the responder service url and the database connection parameters:
++
+----
+$ export PACT_STAGE_DATABASE_URL=jdbc:postgresql://localhost:5432/emergency_response_demo
+$ export PACT_STAGE_DATABASE_USER=naps
+$ export PACT_STAGE_DATABASE_PASSWD=naps
+$ export PACT_VERIFICATION_TARGET=http://$(oc get route responder-service -n user1-pact --template='{{ .spec.host }}'):80
+----
+
+. Run the test from your local workstation:
++
+----
+$ mvn clean verify -Pprovider-pacts
+----
++
+.Sample output
+----
+[INFO] --- maven-failsafe-plugin:2.22.1:integration-test (default) @ responder-service-quarkus ---
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running com.redhat.erdemo.responder.pact.provider.ProcessServicePactVerifications
+
+Verifying a pact between process-service and responder-service
+  [Using File /home/bernard/projects_internal/emergency-response-demo/responder-service-quarkus/target/test-classes/pact/process-service-responder-service.json]
+  Given Available responders
+  A request for available responders
+    returns a response which
+      has status code 200 (OK)
+      has a matching body (OK)
+Jul 06, 2020 10:54:15 PM au.com.dius.pact.provider.DefaultTestResultAccumulator updateTestResult
+WARN: Skipping publishing of verification results as it has been disabled (pact.verifier.publishResults is not 'true')
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.863 s - in com.redhat.erdemo.responder.pact.provider.ProcessServiceP
+actVerifications
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] --- maven-failsafe-plugin:2.22.1:verify (default) @ responder-service-quarkus ---
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  10.170 s
+[INFO] Finished at: 2020-07-06T22:54:16+02:00
+[INFO] ------------------------------------------------------------------------
+----
+
+. To make the test fail, change something in the Pact contract file. For example, change the expected type for the `boatCapacity` field  to `string` instead of `integer`, and test for a type match:
++
+----
+{
+[...]
+        "body": [
+          {
+            "medicalKit": true,
+            "person": true,
+            "latitude": 30.12345,
+            "boatCapacity": "10",
+            "id": "1",
+            "longitude": -70.98765
+          }
+        ],
+        "matchingRules": {
+          "body": {
+            [...]
+            "$[*].boatCapacity": {
+              "matchers": [
+                {
+                  "match": "type"
+                }
+              ],
+              "combine": "AND"
+            },
+[...]
+}
+----
+
+. Run the test again. Expect the test to fail:
++
+----
+[INFO] --- maven-failsafe-plugin:2.22.1:integration-test (default) @ responder-service-quarkus ---
+[INFO]                                                                
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S                                                     
+[INFO] -------------------------------------------------------
+[INFO] Running com.redhat.erdemo.responder.pact.provider.ProcessServicePactVerifications
+
+Verifying a pact between process-service and responder-service
+  [Using File /home/bernard/projects_internal/emergency-response-demo/responder-service-quarkus/target/test-classes/pact/process-service-responder-service.json]
+  Given Available responders                                          
+  A request for available responders
+    returns a response which                                          
+      has status code 200 (OK)                                        
+      has a matching body (FAILED)                                    
+
+Failures:                                                             
+
+1) Verifying a pact between process-service and responder-service - A request for available responders
+
+    1.1) BodyMismatch: $.0.boatCapacity BodyMismatch: Expected 5 (Integer) to be the same type as "10" (String)
+
+    1.2) BodyMismatch: $.1.boatCapacity BodyMismatch: Expected 10 (Integer) to be the same type as "10" (String)
+
+
+Jul 06, 2020 11:03:09 PM au.com.dius.pact.provider.DefaultTestResultAccumulator updateTestResult
+WARN: Skipping publishing of verification results as it has been disabled (pact.verifier.publishResults is not 'true')
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 1.803 s <<< FAILURE! - in com.redhat.erdemo.responder.pact.provider.ProcessServicePactVerifications
+[ERROR] pactVerificationTestTemplate{PactVerificationContext}[1]  Time elapsed: 1.147 s  <<< FAILURE!
+java.lang.AssertionError:                                             
+
+Failures:                                                             
+
+1) Verifying a pact between process-service and responder-service - A request for available responders
+
+    1.1) BodyMismatch: $.0.boatCapacity BodyMismatch: Expected 5 (Integer) to be the same type as "10" (String)
+
+    1.2) BodyMismatch: $.1.boatCapacity BodyMismatch: Expected 10 (Integer) to be the same type as "10" (String)
+
+
+        at com.redhat.erdemo.responder.pact.provider.ProcessServicePactVerifications.pactVerificationTestTemplate(ProcessServicePactVerifications.java:33)
+
+[INFO]                                                                
+[INFO] Results:                                                       
+[INFO]                                                                
+[ERROR] Failures:                                                     
+[ERROR]   ProcessServicePactVerifications.pactVerificationTestTemplate:33 
+Failures:                                                             
+
+1) Verifying a pact between process-service and responder-service - A request for available responders
+
+    1.1) BodyMismatch: $.0.boatCapacity BodyMismatch: Expected 5 (Integer) to be the same type as "10" (String)
+
+    1.2) BodyMismatch: $.1.boatCapacity BodyMismatch: Expected 10 (Integer) to be the same type as "10" (String)
+
+
+[INFO]                                                                
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0
+[INFO]                                                                
+[INFO]                                                                
+[INFO] --- maven-failsafe-plugin:2.22.1:verify (default) @ responder-service-quarkus ---
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD FAILURE                                                  
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  10.608 s                                          
+[INFO] Finished at: 2020-07-06T23:03:10+02:00
+[INFO] ------------------------------------------------------------------------
+----
+
+The next step is to integrate the Pact verification tests as part of a CI/CD pipeline. This is beyond the scope of this course at the moment.
+
+== Tear down the test environment
+
+In order to free up resources on the OpenShift cluster, you can tear down the environment you deployed to run the pact provider verification test. +
+To do so, execute the following Ansible commands:
+
+----
+$ ansible-playbook -i inventories/inventory playbooks/responder_service.yml -e project_admin=user1 -e project_name=pact -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/postgresql.yml -e project_admin=user1 -e project_name=pact -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_topics.yml -e project_admin=user1 -e project_name=pact -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/kafka_cluster.yml -e project_admin=user1 -e project_name=pact -e ACTION=uninstall
+$ ansible-playbook -i inventories/inventory playbooks/amq_streams_operator.yml -e project_admin=user1 -e project_name=pact -e ACTION=uninstall
+----
