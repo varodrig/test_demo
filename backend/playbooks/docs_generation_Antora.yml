@@ -28,7 +28,7 @@
   tasks:
   
   - name: Download source code from repo
-    shell: (mkdir "{{ path_tmp }}";git clone "{{ path_origin }}" "{{ path_tmp }}"; mv temp/.git code/.git)
+    shell: (rm -rf "{{ path_tmp }}"; mkdir "{{ path_tmp }}";git clone "{{ path_origin }}" "{{ path_tmp }}"; mv temp/.git code/.git)
     register: download
     failed_when: download.rc == "already exists and is not an empty directory" not in download.rc
     when: "{{ updateRepo == 'Y' }}"
@@ -62,12 +62,6 @@
   - debug: msg="{{ images.rc }}"
     when: "{{ updateRepo == 'Y' }}"
 
-  - name: Move image folder
-    shell: (rm -rf ../../build/site/content/1/_images/images/; mkdir ../../build/site/content/1/_images/images/; mv ../../build/site/content/1/_images/*.png ../../build/site/content/1/_images/images/)  
-    register: move
-    failed_when: move.rc == "File exists" not in move.rc
-    when: "{{ updateRepo == 'Y' }}"
-
   - name: create nav adoc file
     shell:  (sh nav.sh)
 
@@ -83,9 +77,12 @@
     shell: (rootPath=`pwd`;git add ../../"{{ root }}/"; git commit -m "{{ git_msg }}"; git push)
 
   - name: Run Antora for adoc files
-    shell: (cd ../.. ;antora --fetch antora-playbook.yml)
+    shell: (rm -rf ../../build/site/content/1/;cd ../.. ;antora --fetch antora-playbook.yml)
     register: doc
   - debug: msg="{{ doc.stdout }}"
 
-
+  - name: Move image folder
+    shell: (mkdir ../../build/site/content/1/_images/images/; mv ../../build/site/content/1/_images/*.png ../../build/site/content/1/_images/images/)
+    register: move
+    failed_when: move.rc == "File exists" not in move.rc
 

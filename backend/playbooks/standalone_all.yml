@@ -1,4 +1,5 @@
 - import_playbook: standalone_terminal.yml
+- import_playbook: docs_generation_Antora.yml
 - import_playbook: standalone_docs.yml
 - import_playbook: ../../frontend/playbooks/create-ui.yml
 - import_playbook: standalone_ui.yml
