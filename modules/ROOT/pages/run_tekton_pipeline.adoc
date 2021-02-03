@@ -1,0 +1,131 @@
+:markup-in-source: verbatim,attributes,quotes
+
+// Title comes from the workshop.yaml
+// == Run the OpenShift Pipeline
+
+In previous sections you created and verified the tasks and you created the Pipeline. Now you are ready to execute the pipeline.
+
+== Run the Pipeline
+
+You can start the converted Pipeline either from the %web_console_url%[Web Console], or from command line.
+
+For both methods, you will need to provide input parameters:
+
+- *APP_NAME*: name of app deployment, in our case `petclinic`
+- *APP_GIT_URL*: git repository URL where to get source code
+- *APP_GIT_REVISION*: branch name for git repo
+- *APP_IMAGE_STREAM*: the name of the ImageStream with tag for the app
+- *DEV_NAMESPACE*: name of target project representing the Dev environment for the app
+- *PROD_NAMESPACE*: name of target project representing the Prod environment for the app, where to promote it.
+
+=== Run in the Web Console
+
+. From the Developer Perspective again open `petclinic-pipeline` Pipeline and click on top-right *Actions* drop down list. Then click on *Start*.
++
+image::images/pipeline_action_start.png[Actions Start]
+
+. Inside *Workspaces* section, select from *app-source* drop down list *PVC*, then select *app-source-pvc*.
++
+Leave the default of *Empty Directory* for *maven-settings* since you don't need to provide any custom Maven setting.
+
+. Click the blue *Start* button to run the Pipeline.
++
+image::images/pipeline_start.png[Start Pipeline]
+
+. Follow execution and logs by clicking on active or executed Tasks:
++
+image::images/pipeline_run.png[Pipeline Running]
+
+. You can also follow the logs from the terminal with `tkn`:
++
+[source,bash,subs="{markup-in-source}",role=execute]
+----
+tkn pipeline logs -f
+----
+
+=== Run using the tkn CLI
+
+You can run the Pipeline directly and watch the logs using the `tkn` CLI:
+
+[source,bash,subs="{markup-in-source}",role=execute]
+----
+tkn pipeline start petclinic-pipeline  \
+    --use-param-defaults  \
+    -w name=app-source,claimName=app-source-pvc \
+    -w name=maven-settings,emptyDir= \
+    --showlog \
+    -n pipeline-%guid%
+----
+
+[NOTE]
+In this example you just use the default parameters that the pipeline defined. You could of course specify your own parameters if required.
+
+== Access the Application
+
+image::images/pipeline_successful.png[Pipeline Successful]
+
+If the pipeline was successful, then an image has been pushed into the `pipeline-%guid%-dev` project and a new deployment has been performed. Then the image has been tagged for _prod_ and deployed to `pipeline-%guid%-prod`.
+
+. Validate that the application is running in the Development project:
++
+[source,bash,subs="{markup-in-source}",role=execute]
+----
+oc get pod -n petclinic-%guid%-dev
+----
++
+.Sample Output
+[source,texinfo]
+----
+NAME                 READY   STATUS      RESTARTS   AGE
+petclinic-1-c77xt    1/1     Running     0          17m
+petclinic-1-deploy   0/1     Completed   0          17m
+----
+
+. Find the route for the application in your development project:
++
+[source,bash,subs="{markup-in-source}",role=execute]
+----
+oc get route -n petclinic-%guid%-dev
+----
++
+.Sample Output
+[source,texinfo,options="nowrap"]
+----
+NAME        HOST/PORT                                                                        PATH   SERVICES    PORT       TERMINATION   WILDCARD
+petclinic   petclinic-petclinic-%guid%-dev.%CLUSTER_SUBDOMAIN%          petclinic   8080-tcp
+               None
+----
+
+. Use the route (`petclinic-petclinic-%guid%-dev.%CLUSTER_SUBDOMAIN%` in the example above) in a web browser to validate that the application is working.
+. Also check that the production application is working. First check that the pod is running in your production project (note that you will not see a build pod in this project - you only build the container image in the development project):
++
+[source,bash,subs="{markup-in-source}",role=execute]
+----
+oc get pod -n petclinic-%guid%-prod
+----
++
+.Sample Output
+[source,texinfo]
+----
+NAME                 READY   STATUS      RESTARTS   AGE
+petclinic-1-8nrnc    1/1     Running     0          21m
+petclinic-1-deploy   0/1     Completed   0          21m
+----
+
+. Retrieve the route for the production application:
++
+[source,bash,subs="{markup-in-source}",role=execute]
+----
+oc get route -n petclinic-%guid%-prod
+----
++
+.Sample Output
+[source,texinfo,options="nowrap"]
+----
+NAME        HOST/PORT                                                                         PATH   SERVICES    PORT       TERMINATION   WILDCARD
+petclinic   petclinic-petclinic-%guid%-prod.%CLUSTER_SUBDOMAIN%          petclinic   8080-tcp
+                None
+----
+. Then check that the production application is also running.
+
+image::images/pipeline_app_deployed.png[App deployed]
