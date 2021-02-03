@@ -1,7 +1,4 @@
 * xref:add_webhook.adoc[Adding Triggers to the Pipeline]
 * xref:create_tekton_pipeline.adoc[OpenShift Pipeline]
 * xref:index.adoc[Overview]
-* xref:run_jenkins_pipeline.adoc[Run the Jenkins Pipeline]
-* xref:run_tekton_pipeline.adoc[Run the OpenShift Pipeline]
-* xref:test_tekton_tasks.adoc[Test Tekton Tasks]
 * xref:user_information.adoc[User Information]
